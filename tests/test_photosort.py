@@ -70,3 +70,21 @@ def test_report_action_moves_nothing(tmp_path):
     s = photosort.sort_folder(CFG, tmp_path, action="report", classifier=FakeClassifier())
     assert s["buckets"] == {"food": 1}
     assert (tmp_path / "lunch.jpg").exists() and not (tmp_path / "food").exists()
+
+
+@pytest.mark.parametrize("seconds,expected", [(0.4, "0.4s"), (42.34, "42.3s"), (59.97, "1m 00s"),
+                                              (65.2, "1m 05s"), (3723, "1h 02m 03s")])
+def test_format_duration(seconds, expected):
+    assert photosort.format_duration(seconds) == expected
+
+
+def test_finish_report_shows_duration(tmp_path):
+    for name in ["selfie.jpg", "lunch.jpg", "clip.mov"]:
+        (tmp_path / name).write_bytes(b"x")
+    s = photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier())
+    text = photosort.format_report(s)
+    assert f"Duration    : {photosort.format_duration(s['elapsed_s'])}" in text
+    assert s["started_at"].replace("T", " ") in text and s["finished_at"].replace("T", " ") in text
+    assert "2 images moved; 0 errors; 1 non-image files left in place" in text
+    assert "images/min" in text and "people" in text and "food" in text
+    assert photosort.format_report({**s, "action": "report"}).count("no files changed") == 1

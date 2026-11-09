@@ -54,6 +54,9 @@ Behavior:
 - If a file can't be classified (after 3 retries) it stays in place and the error is journaled.
 - Every run appends to `_photosort_journal.jsonl` in the destination folder: run id, source, destination,
   bucket, confidence, errors. `undo` uses it.
+- When the run ends, `sort` prints a **finish report**: how many images were sorted, errors, non-image files
+  left in place, the **duration** (whole run: start, preflight, scan, classify, move; with start/finish
+  times), speed in images/min, the journal path and a per-bucket count. `-v` also logs the raw JSON summary.
 - Exit code: 0 = all sorted, 1 = some files failed, 2 = setup/config error.
 
 ## Configuration (`config.json`)
@@ -77,6 +80,7 @@ To add/rename a bucket, edit `buckets` in `config.json` and add a one-line descr
    schema that forces `{"bucket": <one of the buckets>, "confidence": 0-1}` (`think` off, temperature 0).
 3. PAIR routes each request to a cluster node that has the model, favouring idle/fast nodes.
 4. As each result arrives the file is moved/copied and the journal line is written.
+5. After the last file, the finish report (counts, duration, images/min, per-bucket totals) is printed.
 
 ## Model choice (benchmark 2026-11-09)
 

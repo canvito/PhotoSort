@@ -179,6 +179,7 @@ def unique_path(target: Path) -> Path:
 
 def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str = "move",
                 recursive: bool = False, limit: int = 0, classifier=None) -> dict:
+    started, t_start = datetime.now(), time.perf_counter()
     source = Path(source).resolve()
     dest = Path(dest).resolve() if dest else source
     if not source.is_dir():
@@ -189,13 +190,12 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
         clf.preflight()
     images, skipped = scan(source, dest, cfg["buckets"], recursive)
     images = images[: limit or None]
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    run_id = started.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     journal = dest / JOURNAL_NAME
     dest.mkdir(parents=True, exist_ok=True)
     counts, errors = Counter(), 0
     log.info("run %s: %d images, %d non-image files left in place, action=%s, model=%s, workers=%d",
              run_id, len(images), skipped, action, cfg["model"], cfg["concurrency"])
-    t0 = time.perf_counter()
     ex = ThreadPoolExecutor(max_workers=cfg["concurrency"], thread_name_prefix="photosort")
     with journal.open("a", encoding="utf-8") as jf:
         futures = {ex.submit(clf.classify, p): p for p in images}
@@ -225,13 +225,48 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
             raise
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
-    elapsed = time.perf_counter() - t0
-    summary = {"run_id": run_id, "journal": str(journal), "sorted": sum(counts.values()), "errors": errors,
-               "skipped_non_images": skipped, "elapsed_s": round(elapsed, 1),
-               "per_min": round(sum(counts.values()) / elapsed * 60, 1) if elapsed else 0.0,
+    elapsed = time.perf_counter() - t_start
+    n_sorted = sum(counts.values())
+    summary = {"run_id": run_id, "action": action, "model": cfg["model"], "workers": cfg["concurrency"],
+               "source": str(source), "dest": str(dest), "journal": str(journal),
+               "sorted": n_sorted, "errors": errors, "skipped_non_images": skipped,
+               "started_at": started.isoformat(timespec="seconds"),
+               "finished_at": datetime.now().isoformat(timespec="seconds"),
+               "elapsed_s": round(elapsed, 1),
+               "per_min": round(n_sorted / elapsed * 60, 1) if elapsed else 0.0,
                "buckets": dict(counts.most_common())}
-    log.info("summary: %s", json.dumps(summary))
+    log.debug("summary: %s", json.dumps(summary))
     return summary
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 59.95:
+        return f"{seconds:.1f}s"
+    hours, rest = divmod(int(round(seconds)), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}h {minutes:02d}m {secs:02d}s" if hours else f"{minutes}m {secs:02d}s"
+
+
+def format_report(s: dict) -> str:
+    """Plain-ASCII finish report for a sort run (the dict returned by sort_folder)."""
+    done = {"move": "moved", "copy": "copied"}.get(s["action"], "classified (no files changed)")
+    rows = [("Run", s["run_id"]), ("Source", s["source"])]
+    if s["dest"] != s["source"]:
+        rows.append(("Destination", s["dest"]))
+    rows += [
+        ("Model", f"{s['model']}, {s['workers']} parallel workers"),
+        ("Result", f"{s['sorted']} images {done}; {s['errors']} errors; "
+                   f"{s['skipped_non_images']} non-image files left in place"),
+        ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "
+                     f"finished {s['finished_at'].replace('T', ' ')})"),
+        ("Speed", f"{s['per_min']} images/min"),
+        ("Journal", s["journal"]),
+    ]
+    lines = ["", "=== PhotoSort finish report ==="] + [f"{k:<12}: {v}" for k, v in rows]
+    if s["buckets"]:
+        width = max(len(name) for name in s["buckets"])
+        lines += ["", "Buckets"] + [f"  {name:<{width}}  {n:>4}" for name, n in s["buckets"].items()]
+    return "\n".join(lines)
 
 
 def undo(journal: Path, run_id: str | None = None) -> dict:
@@ -301,6 +336,9 @@ def main(argv=None) -> int:
         if a.concurrency:
             cfg["concurrency"] = a.concurrency
         summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit)
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")  # odd characters in a path must not crash the report
+        print(format_report(summary), flush=True)
         return 1 if summary["errors"] else 0
     except (LocalOnlyError, ClassifyError, FileNotFoundError, ValueError, requests.RequestException) as e:
         log.error("%s", e)
