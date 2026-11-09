@@ -6,6 +6,7 @@
   "timeout_s": 300,
   "retries": 3,
   "action": "move",
+  "face_workers": ["spark1:16"],
   "buckets": {
     "people": "Photos whose main subject is one or more people: selfies, portraits, group shots, family, kids.",
     "home": "Photos of a home: rooms, interiors, furniture, appliances, house exterior, yard, home projects or repairs.",

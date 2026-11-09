@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
 
+from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
+
 try:
     import pillow_heif
 
@@ -318,6 +320,23 @@ def main(argv=None) -> int:
     u = sub.add_parser("undo", help="move files from a sort run back to their original location")
     u.add_argument("journal", type=Path, help=f"path to {JOURNAL_NAME}")
     u.add_argument("--run-id", help="run to undo (default: latest run not yet undone)")
+    f = sub.add_parser("faces", help="detect and locally tag faces using named reference-photo folders")
+    f.add_argument("source", type=Path, help="folder of photos to analyze; originals are not modified")
+    f.add_argument("--people", type=Path, required=True,
+                   help="folder containing one subfolder per person, with clear reference photos")
+    f.add_argument("--output", type=Path, help="JSON sidecar path (default: <source>\\photosort_faces.json)")
+    f.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")
+    f.add_argument("--model-dir", type=Path, help="InsightFace root for a `local` worker (default: ~/.insightface)")
+    f.add_argument("--workers", help="where detection runs: comma-separated HOST[:THREADS] SSH hosts and/or "
+                                     "local[:THREADS] (default: face_workers in config.json)")
+    f.add_argument("--threshold", type=float, default=0.45, help="minimum cosine similarity to assign a name")
+    f.add_argument("--margin", type=float, default=0.05,
+                   help="minimum lead over the second-best person; ambiguous matches remain unknown")
+    f.add_argument("--recursive", action="store_true", help="include subfolders")
+    f.add_argument("--limit", type=int, default=0, help="only process the first N images")
+    fs = sub.add_parser("faces-setup", help="install the face worker environment and model on SSH hosts")
+    fs.add_argument("hosts", nargs="+", help="SSH host aliases, e.g. spark1")
+    fs.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -325,6 +344,19 @@ def main(argv=None) -> int:
         if a.cmd == "undo":
             undo(a.journal, a.run_id)
             return 0
+        if a.cmd == "faces-setup":
+            for host in a.hosts:
+                info = setup_remote_worker(host, a.model)
+                print(f"OK: {host} ({info.get('host')}) face worker ready: {info.get('provider')}", flush=True)
+            return 0
+        if a.cmd == "faces":
+            workers = a.workers or load_config(a.config).get("face_workers") or ["local"]
+            result = tag_people(a.source, a.people, a.output, IMAGE_EXTS, a.recursive, a.limit,
+                                a.threshold, a.margin, a.model, a.model_dir, workers=workers)
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(errors="replace")
+            print(format_face_report(result), flush=True)
+            return 1 if result["summary"]["errors"] else 0
         cfg = load_config(a.config)
         if a.cmd == "check":
             names = Classifier(cfg).preflight()
@@ -340,7 +372,8 @@ def main(argv=None) -> int:
             sys.stdout.reconfigure(errors="replace")  # odd characters in a path must not crash the report
         print(format_report(summary), flush=True)
         return 1 if summary["errors"] else 0
-    except (LocalOnlyError, ClassifyError, FileNotFoundError, ValueError, requests.RequestException) as e:
+    except (LocalOnlyError, ClassifyError, FaceTaggingError, FileNotFoundError,
+            ValueError, requests.RequestException) as e:
         log.error("%s", e)
         return 2
     except KeyboardInterrupt:

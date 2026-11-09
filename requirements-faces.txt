@@ -1,0 +1,2 @@
+# Optional local face detection and recognition dependencies.
+insightface>=0.7.3

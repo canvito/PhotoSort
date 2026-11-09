@@ -59,6 +59,117 @@ Behavior:
   times), speed in images/min, the journal path and a per-bucket count. `-v` also logs the raw JSON summary.
 - Exit code: 0 = all sorted, 1 = some files failed, 2 = setup/config error.
 
+## Local face tagging
+
+`faces` uses InsightFace (`buffalo_l`: SCRFD face detection + ArcFace embeddings) to find faces and
+match them to named reference photos. It does **not** train or fine-tune a model: adding a person means
+adding reference photos. No photo is sent to PAIR, Google Colab, or a cloud service. Workers refuse to
+run unless the model files are already on disk; they never download models while tagging.
+
+### Where detection runs: face workers
+
+Detection runs in **face workers** (`face_worker.py`), listed in `face_workers` in `config.json`
+(default `["spark1:16"]`) or with `--workers`:
+
+| Worker | Meaning |
+|---|---|
+| `spark1:16` | SSH host alias `spark1`, 16 images in flight (GB10 GPU, CUDA) |
+| `local:4` | A worker on this PC (needs the local install below) |
+| `spark1:16,local:2` | Both; work is balanced by load and a request is retried on another worker if one dies |
+
+PAIR cannot run InsightFace (it only routes LLM engines), so workers use plain SSH. On each run the
+coordinator (this PC) starts the worker over SSH, checks its code hash and redeploys
+`~/.photosort/face_worker.py` automatically when it is missing or stale.
+
+**Privacy and transport:** photos are read on this PC and sent only through the encrypted SSH connection,
+via an `ssh -L` tunnel to a port that the worker opens on its own `127.0.0.1` and unlocks with a one-time
+token. The worker decodes images in memory, writes nothing to disk and exits when the SSH session ends.
+Hosts that resolve to a public Internet address are refused (LAN, VPN and Tailscale addresses are fine).
+Reference photos, person embeddings and name matching stay on this PC; the sidecar stores no embeddings.
+
+**One-time worker setup** (spark1 is already set up). Requirements: Linux or macOS, `bash`, Python 3.10+,
+key-based SSH (the alias must work with `ssh HOST` and no password prompt). No `sudo` needed:
+
+```powershell
+.\photosort.cmd faces-setup spark1
+```
+
+This creates `~/.photosort/venv` on the host (ONNX Runtime GPU build with bundled CUDA/cuDNN when
+`nvidia-smi` exists, else CPU), installs InsightFace, downloads `buffalo_l` to `~/.insightface/models`
+on that host, deploys the worker and test-starts it. If a run says to run `faces-setup HOST`, do so.
+
+**Speed** (578 Camera Roll images, 814 MB, wired gigabit Ethernet, 2026-11-09):
+
+| Workers | Transport | Detect time | Throughput |
+|---|---|---:|---:|
+| `spark1:16` | SSH stdin/stdout (first version) | 70.0 s | 496 images/min, 11.6 MB/s |
+| `spark1:8` | `ssh -L` tunnel | 10.4 s | 3,347 images/min, 78.6 MB/s |
+| `spark1:16` | `ssh -L` tunnel | 9.5 s | **3,659 images/min**, 85.9 MB/s |
+| `spark1:32` | `ssh -L` tunnel | 10.2 s | 3,389 images/min, 79.6 MB/s |
+
+Worker startup adds ~7–9 s per run. The GB10 is not the limit: with the tunnel, this PC's gigabit link
+is (Windows OpenSSH moves only ~10 MB/s through a single session's stdin/stdout, hence the tunnel). Use
+wired Ethernet; more threads or more GPU nodes will not make it much faster while the link is saturated.
+
+**Other nodes:** only spark1 accepts SSH today. AxiDvBb1, CVPRISM2, MinDvBb1 and ErsDvBb1 have port 22
+closed, and the Mac-mini refuses it (Remote Login off). A Linux/macOS node becomes a worker after enabling
+its SSH server, adding a key-based alias, and running `faces-setup HOST`. Windows nodes (e.g. CVPRISM2) are
+not supported yet: the setup script and remote paths assume `bash` and `~`.
+
+### Optional: a worker on this PC (`local`)
+
+Install the optional dependencies once, then download the public model pack once. This setup step
+downloads model weights only; it does not upload photos:
+
+```powershell
+C:\Users\<you>\miniconda3\envs\utils\python.exe -m pip install -r requirements-faces.txt
+C:\Users\<you>\miniconda3\envs\utils\python.exe -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='buffalo_l')"
+```
+
+By default the model pack is stored under `%USERPROFILE%\.insightface\models\buffalo_l` (`--model-dir`
+changes it for a `local` worker). On an NVIDIA GPU, install the CUDA runtime after the dependencies (the
+default CPU runtime also works, but is slower):
+
+```powershell
+C:\Users\<you>\miniconda3\envs\utils\python.exe -m pip uninstall -y onnxruntime
+C:\Users\<you>\miniconda3\envs\utils\python.exe -m pip install onnxruntime-gpu
+```
+
+The worker uses CUDA when ONNX Runtime exposes it and otherwise uses CPU.
+
+### Reference people and running
+
+Create one reference subfolder per person; each reference image must contain exactly one clear face:
+
+```text
+D:\PhotoSort\people\
+  Alice\
+    alice-1.jpg
+    alice-2.jpg
+  Bob\
+    bob-1.jpg
+```
+
+Then analyze a folder. `--recursive` is useful for month folders already sorted into bucket subfolders:
+
+```powershell
+.\photosort.cmd faces "C:\Users\<you>\OneDrive\Pictures\Camera Roll\2026\10" --people "D:\PhotoSort\people" --recursive --limit 20
+.\photosort.cmd faces "<folder>" --people "D:\PhotoSort\people" --recursive
+.\photosort.cmd faces "<folder>" --people "D:\PhotoSort\people" --workers spark1:16,local:2
+```
+
+This writes/replaces `<folder>\photosort_faces.json`; original photos are never modified. The JSON
+sidecar records each image's relative path and each detected face's person name (or `null` when
+unknown/ambiguous), cosine similarity, and face bounding box in pixels, plus the workers used. Raise
+`--threshold` (default `0.45`) or `--margin` (default `0.05`) to be more conservative. Start with
+`--limit 20` and check the sidecar before processing a full library. Reference photos should be
+representative; use several different clear photos per person. The sidecar is a tagging manifest, not
+embedded XMP metadata. The finish report shows the duration, speed and images handled per worker.
+
+**Model terms:** [InsightFace's Python library is MIT-licensed](https://github.com/deepinsight/insightface/blob/master/python-package/README.md#license),
+but its provided pretrained model weights are restricted to non-commercial research use. This model
+pack is intended for personal/non-commercial use; review the model license before commercial use.
+
 ## Configuration (`config.json`)
 
 | Key | Default | Meaning |
@@ -69,6 +180,7 @@ Behavior:
 | `max_side` | `1024` | Images are downscaled in memory before sending; originals untouched |
 | `timeout_s`, `retries` | `300`, `3` | Per-request timeout and retry count |
 | `action` | `move` | Default action: `move`, `copy` or `report` |
+| `face_workers` | `["spark1:16"]` | Where `faces` runs detection: SSH `HOST[:THREADS]` and/or `local[:THREADS]`; `--workers` overrides |
 | `buckets` | 13 buckets | `name: description`. Descriptions are sent to the model, so make them specific. `other` is required. |
 
 To add/rename a bucket, edit `buckets` in `config.json` and add a one-line description.
@@ -126,6 +238,10 @@ so they can't use the whole cluster; switch `model` only if 12b accuracy isn't g
 - PAIR quirks seen: `/api/show` through the proxy can hit a node without models (404) — PhotoSort only
   uses `/api/tags` and `/api/chat`. MinDvBb1 receives no proxy traffic; ErsDvBb1 has no models.
 - Mac-mini runs different builds of `gemma4:12b`/`qwen3.5:9b`; re-pull them there for consistent results.
+- `faces`: "face worker environment not found" means the host was never set up: run
+  `.\photosort.cmd faces-setup HOST`. Check SSH itself with `ssh -o BatchMode=yes HOST hostname`
+  (it must not prompt). If one of several workers fails, the run continues on the others and the report
+  lists it as failed. Workers stop when their SSH session ends, so nothing keeps GPU memory after a run.
 
 ## Tests
 
