@@ -111,6 +111,11 @@ Worker startup adds ~7–9 s per run. The GB10 is not the limit: with the tunnel
 is (Windows OpenSSH moves only ~10 MB/s through a single session's stdin/stdout, hence the tunnel). Use
 wired Ethernet; more threads or more GPU nodes will not make it much faster while the link is saturated.
 
+Shrinking photos on this PC before sending was tested and is **not used**, because it changes results. On
+the same 578 photos (268 faces), shrinking to 3000/2048/1600 px sent 1.8–4.4× less data, but lost 3–5 faces
+and changed 24–53 of ~35,000 same/different-person decisions at the 0.45 threshold. Full-resolution runs
+are exactly repeatable. To go faster without changing results, use faster networking (2.5/10 GbE).
+
 **Other nodes:** only spark1 accepts SSH today. AxiDvBb1, CVPRISM2, MinDvBb1 and ErsDvBb1 have port 22
 closed, and the Mac-mini refuses it (Remote Login off). A Linux/macOS node becomes a worker after enabling
 its SSH server, adding a key-based alias, and running `faces-setup HOST`. Windows nodes (e.g. CVPRISM2) are

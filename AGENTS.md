@@ -53,4 +53,7 @@ automatically when it changes; no manual copy needed.
 - Only spark1 accepts SSH. AxiDvBb1, CVPRISM2, MinDvBb1, ErsDvBb1 have port 22 closed; the Mac-mini has
   Remote Login off. Windows workers (e.g. CVPRISM2) are not supported by the code yet.
 - spark1:16 does ~3,660 images/min; the limit is this PC's gigabit link, so more workers add little.
+- Do not shrink or re-encode photos before sending them to gain speed: tested, it changes results (lost
+  1–2% of faces, flipped some matches). Full-resolution results are exactly repeatable. Faster networking
+  is the only speed-up the user accepts (no speed-for-accuracy trades).
 - PAIR cannot run InsightFace (it only routes LLM engines); that is why face workers use SSH.
