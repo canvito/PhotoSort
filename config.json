@@ -1,0 +1,24 @@
+{
+  "base_url": "http://127.0.0.1:11434",
+  "model": "gemma4:12b",
+  "concurrency": 12,
+  "max_side": 1024,
+  "timeout_s": 300,
+  "retries": 3,
+  "action": "move",
+  "buckets": {
+    "people": "Photos whose main subject is one or more people: selfies, portraits, group shots, family, kids.",
+    "home": "Photos of a home: rooms, interiors, furniture, appliances, house exterior, yard, home projects or repairs.",
+    "pets_animals": "Photos of pets or any other animals.",
+    "food": "Photos of food, drinks, meals, restaurant dishes, groceries or cooking.",
+    "nature": "Outdoor nature: landscapes, mountains, beaches, forests, plants, flowers, sky, sunsets.",
+    "travel_places": "Places visited: cities, streets, landmarks, buildings, attractions, airports, hotels, vehicles while traveling.",
+    "documents_receipts": "Camera photos (not screenshots) of paper documents, receipts, bills, forms, IDs, whiteboards or signs.",
+    "screenshot_code": "Screenshots of source code, terminals, IDEs, logs or developer tools.",
+    "screenshot_chat": "Screenshots of chats, text messages, email or social-media conversations.",
+    "screenshot_finance_charts": "Screenshots of stock/crypto charts, trading or brokerage apps, bank accounts or financial dashboards.",
+    "screenshot_other": "Any other screenshot of a phone or computer screen: apps, websites, settings, maps, order confirmations.",
+    "memes": "Memes, jokes or images with overlaid humorous captions, including screenshots shared as memes.",
+    "other": "Anything that fits none of the other buckets."
+  }
+}
