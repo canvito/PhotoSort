@@ -1,0 +1,128 @@
+import { useCallback, useEffect, useState } from 'react';
+import { Link, Route, Switch, useLocation } from 'wouter';
+import { useServerEvents, usePoll, useShellInfo, type Meta, type PairHealth, type ShellInfo } from './api.ts';
+import { Icon } from './icons.tsx';
+import { Overview } from './pages/Overview.tsx';
+import { Placeholder } from './pages/Placeholder.tsx';
+import { Privacy } from './pages/Privacy.tsx';
+
+export const NAV = [
+  { path: '/', label: 'Overview', icon: 'overview' },
+  { path: '/sort', label: 'Sort', icon: 'sort' },
+  { path: '/group', label: 'Group', icon: 'group' },
+  { path: '/search', label: 'Search', icon: 'search' },
+  { path: '/faces', label: 'Faces', icon: 'faces' },
+  { path: '/runs', label: 'Runs & Undo', icon: 'runs' },
+  { path: '/cluster', label: 'Cluster', icon: 'cluster' },
+  { path: '/settings', label: 'Settings', icon: 'settings' },
+  { path: '/privacy', label: 'Privacy', icon: 'privacy' },
+] as const;
+
+export interface Ctx {
+  meta?: Meta;
+  pair?: PairHealth;
+  pairError?: string;
+  shell?: ShellInfo;
+  connected: boolean;
+}
+
+function pairState(c: Ctx): { tone: 'ok' | 'warn' | 'bad'; text: string } {
+  if (c.pairError || !c.pair) return { tone: 'bad', text: c.pair ? 'PAIR error' : 'PAIR …' };
+  if (!c.pair.reachable) return { tone: 'bad', text: 'PAIR down' };
+  if (c.pair.required.some((m) => m.cloud)) return { tone: 'bad', text: 'Cloud model configured' };
+  if (c.pair.required.some((m) => !m.present)) return { tone: 'warn', text: 'PAIR: model missing' };
+  return { tone: 'ok', text: `PAIR · ${c.pair.models} models` };
+}
+
+export function App() {
+  const [location] = useLocation();
+  const meta = usePoll<Meta>('/api/meta', 30000);
+  const health = usePoll<{ pair: PairHealth }>('/api/health', 10000);
+  const [shell, setShell] = useShellInfo();
+  const [stopped, setStopped] = useState(false);
+  const [blur, setBlur] = useState(() => localStorage.getItem('blur') === '1');
+  const connected = useServerEvents(useCallback((e) => { if (e.type === 'shutdown') setStopped(true); }, []));
+
+  useEffect(() => {
+    document.body.classList.toggle('blur-media', blur);
+    localStorage.setItem('blur', blur ? '1' : '0');
+  }, [blur]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setBlur((b) => !b);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const ctx: Ctx = { meta: meta.data, pair: health.data?.pair, pairError: health.error, shell, connected };
+  const pill = pairState(ctx);
+  const fixture = meta.data?.mode === 'fixture';
+  const toggleProtection = async () => {
+    if (window.photosort && shell) setShell(await window.photosort.setProtection(!shell.protection));
+  };
+
+  return (
+    <div className="app">
+      <nav className="nav" aria-label="Pages">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true" />
+          PhotoSort
+        </div>
+        {NAV.map((n) => (
+          <Link key={n.path} href={n.path} className={`nav-item${location === n.path ? ' active' : ''}`}>
+            <Icon name={n.icon} />
+            <span>{n.label}</span>
+          </Link>
+        ))}
+        <div className="nav-foot">
+          {meta.data ? `v${meta.data.version}` : ''}
+          <span className={`dot ${connected ? 'ok' : 'bad'}`} title={connected ? 'Live updates connected' : 'Live updates reconnecting'} />
+        </div>
+      </nav>
+      <div className="main">
+        <header className="topbar">
+          <h1>{NAV.find((n) => n.path === location)?.label ?? 'PhotoSort'}</h1>
+          <div className="topbar-right">
+            {fixture && <span className="badge fixture" title="Synthetic test data only">FIXTURE</span>}
+            <Link href="/" className={`pill ${pill.tone}`} title={ctx.pair?.error ?? ctx.pairError ?? 'Local NVIDIA PAIR proxy'}>
+              <span className={`dot ${pill.tone}`} />
+              {pill.text}
+            </Link>
+            {shell && (
+              <button type="button" className={`chip ${shell.protection ? 'on' : 'off'}`} onClick={toggleProtection}
+                title="Content protection: screenshots, screen sharing and recording see a black window. It cannot stop a phone camera.">
+                <Icon name="shield" size={16} />
+                {shell.protection ? 'Protected' : 'Not protected'}
+              </button>
+            )}
+            <button type="button" className={`chip ${blur ? 'on' : 'off'}`} onClick={() => setBlur((b) => !b)}
+              title="Blur photos and captions (Ctrl+Shift+B)">
+              <Icon name="blur" size={16} />
+              Blur
+            </button>
+          </div>
+        </header>
+        {!window.photosort && <div className="banner warn">Opened outside the PhotoSort window: the network guard and content protection are off. Use dashboard.ps1 open.</div>}
+        {stopped && <div className="banner bad">The dashboard server stopped. Start it again with dashboard.ps1.</div>}
+        <main className="content">
+          <Switch>
+            <Route path="/"><Overview ctx={ctx} reloadHealth={health.reload} /></Route>
+            <Route path="/privacy"><Privacy ctx={ctx} /></Route>
+            <Route path="/sort"><Placeholder page="sort" /></Route>
+            <Route path="/group"><Placeholder page="group" /></Route>
+            <Route path="/search"><Placeholder page="search" /></Route>
+            <Route path="/faces"><Placeholder page="faces" /></Route>
+            <Route path="/runs"><Placeholder page="runs" /></Route>
+            <Route path="/cluster"><Placeholder page="cluster" /></Route>
+            <Route path="/settings"><Placeholder page="settings" /></Route>
+            <Route><div className="card"><h2>Not found</h2><p>This page does not exist. <Link href="/">Back to Overview</Link></p></div></Route>
+          </Switch>
+        </main>
+      </div>
+    </div>
+  );
+}

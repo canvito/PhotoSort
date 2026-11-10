@@ -18,6 +18,9 @@ namely the bucket and group folders, the moved files, `_photosort_journal.jsonl`
 confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive.
 See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
+A desktop window, the [Dashboard](#dashboard-dashboardps1), is being added in phases; start it with
+`.\dashboard.ps1` and stop it with `.\dashboard.ps1 stop`.
+
 ## Setup (once)
 
 ```powershell
@@ -414,6 +417,102 @@ time, so only that video is reported as an error.
 but its provided pretrained model weights are restricted to non-commercial research use. This model
 pack is intended for personal/non-commercial use; review the model license before commercial use.
 
+## Dashboard (`dashboard.ps1`)
+
+A desktop window for PhotoSort, built in phases. **Now (P0):** the window, its local server, PAIR health and
+the privacy checks. The other pages show the matching CLI command until their phase lands: P1 runs sort,
+group, index and undo as jobs; P2 adds search, browsing and thumbnails; P3 adds runs, the cluster view and live
+privacy checks; P4 adds faces and settings.
+
+```powershell
+cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
+.\dashboard.ps1            # start: installs what is missing (asks first), starts the server, opens the window
+.\dashboard.ps1 stop       # closes the window and stops the server
+.\dashboard.ps1 status     # running or not, versions, PAIR and model state (no file names or paths)
+.\dashboard.ps1 open       # reopens the window of a running dashboard
+.\dashboard.ps1 restart
+.\dashboard.ps1 setup      # installs or updates without starting
+```
+
+It works in PowerShell 7 and Windows PowerShell 5.1. If scripts are blocked, run
+`powershell -ExecutionPolicy Bypass -File .\dashboard.ps1`.
+
+| Flag | Meaning |
+|---|---|
+| `-NoOpen` | start the server without the window |
+| `-Gpu auto\|rtx\|igpu` | `auto` (default): the RTX GPU on AC power, Iris Xe on battery |
+| `-Port N` | use this port (default 47615, else the next free one up to 47625) |
+| `-Yes` | allow installs without asking (needed when nobody can answer, e.g. scripts) |
+| `-Force` | `stop`: end the server if it doesn't stop within 10 s (never while a job runs) |
+| `-LeaveJobRunning` | `stop`: stop the dashboard but let a running job finish (P1) |
+| `-Rebuild`, `-Update` | rebuild the web app; update Electron |
+| `-UseSystemNode`, `-Python PATH` | use the installed Node.js 24–26; use another Python |
+| `-Fixture` | synthetic test library, fake PAIR, own data folder and port 47616 (for tests and agents) |
+
+Exit codes: 0 done, 1 failed, 2 a needed install is missing or was declined, 3 not running.
+
+**What setup installs** (it asks first; each step re-runs only when its input changed):
+- Node.js 26 LTS, a private copy in `%LOCALAPPDATA%\PhotoSort\runtime` (zip from nodejs.org, checked against
+  its SHA-256 list). Your installed Node.js, if any, is not used or changed.
+- npm packages in `dashboard\node_modules` (`npm ci --ignore-scripts`, pinned by `package-lock.json`) and
+  Electron 45.
+- The web app build (`dashboard\web\dist`).
+- A check that PhotoSort's Python env has its packages (it offers `pip install -r requirements.txt`).
+
+**How it keeps your photos private:**
+- The server is Node.js on `127.0.0.1` only, with a new random token per start. It refuses other host names,
+  other sites' pages and unknown request fields.
+- Its only outbound connection is the PAIR proxy on `127.0.0.1`: read-only model list and status, refusing
+  cloud models. A test fails if any other server file opens a connection.
+- The window (Electron) is the only client. It adds the token itself, so the page never sees it.
+- The window blocks every request that is not to its own server, internet and LAN alike, and resolves no
+  host names. It also turns off proxies, WebRTC UDP, navigation, new windows, downloads, permissions and
+  spell-check downloads.
+- Content protection is on: screenshots and screen sharing see a black window. The shield chip in the top bar
+  turns it off, e.g. to share the screen. The Blur chip (Ctrl+Shift+B) will blur thumbnails (P2).
+- The page has no access to Node.js or files.
+- Check it with `.\dashboard.ps1 start -Fixture -NoOpen`, then `.\dashboard.ps1 selftest -Fixture` (8 checks),
+  then `.\dashboard.ps1 stop -Fixture`.
+
+**Graphics:** the window draws with the GPU. Chromium can't choose the GPU on Windows, so `dashboard.ps1` sets
+Windows' per-app graphics preference for the dashboard's own `electron.exe` before each launch. The value is
+in `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`: `GpuPreference=2` is the RTX 4060, `1` is the Iris
+Xe. To remove it, use Settings > System > Display > Graphics, or delete that value. This is drawing only; no
+model runs on this PC.
+
+**Where its data lives** (outside the repo and OneDrive; it refuses a data folder inside OneDrive):
+- `%LOCALAPPDATA%\PhotoSort\runtime`: Node.js and the Python-check cache.
+- `%LOCALAPPDATA%\PhotoSort\dashboard`:
+  - `state.json`: the port, process id and this run's token;
+  - `shell.json`: the window's process;
+  - `logs\`: `server-*`, `shell-*` and `setup-*` logs, which hold events and counts, no file names;
+  - `shell\`: the window's browser cache.
+- `%LOCALAPPDATA%\PhotoSort\dashboard-fixture`: the same for `-Fixture`, plus the synthetic `library\`.
+- `dashboard\node_modules` and `dashboard\web\dist` are git-ignored.
+
+**Measured on this PC (2026-11-10):**
+
+| Step | Time |
+|---|---|
+| First setup, including the npm and Electron downloads | 27.3 s |
+| Setup when nothing changed | 1.1 s |
+| Start | 2.5–3.7 s (target ≤ 4 s) |
+| Stop | 1.3–2.9 s (target ≤ 5 s) |
+| Opening the window | ~3.5 s |
+| `status` | 2.4 s (PowerShell 7), 3.5 s (5.1) |
+| Window self-test | 4.0–4.3 s |
+
+**Troubleshooting:**
+- "The server did not start": read `logs\server-crash.log` or `logs\server-<date>.log` in the data folder.
+- The window doesn't open or stays blank: check `.\dashboard.ps1 status`, then `logs\shell-<date>.log` (window
+  events only).
+- Port in use: it takes the next free port; or pass `-Port`.
+- The window runs on the wrong GPU: pass `-Gpu rtx` or `-Gpu igpu`, or check Windows' graphics settings for
+  `electron.exe`.
+- Offline: once set up, start, stop and status need no internet. First setup needs nodejs.org, the npm
+  registry and GitHub (the Electron download).
+- "The dashboard is running; stop it before …" during setup: packages are never replaced while a dashboard runs.
+
 ## Configuration (`config.json`)
 
 | Key | Default | Meaning |
@@ -508,6 +607,11 @@ videos) and found **no photo, video, frame, face or caption sent to a cloud mode
   did see 16 file names out of 31,253 (no image content), in tailed progress lines, error lines and
   `search --paths-only` output. Agents now keep those lines in a local log (see `AGENTS.md`).
 
+**Since the audit, the dashboard** (see [Dashboard](#dashboard-dashboardps1)) keeps its data in
+`%LOCALAPPDATA%\PhotoSort\dashboard`: state, logs without file names, and the window's cache. Its server
+connects only to PAIR on `127.0.0.1`, and its window only to that server. `.\dashboard.ps1 selftest -Fixture`
+rechecks the window's guard.
+
 To recheck PAIR routing at any time, count requests by target. Every target should be a `192.168.x.x` node,
 `cluster` (PAIR's own model list) or blank (a request that was never routed):
 
@@ -548,4 +652,14 @@ Get-Content "$env:LOCALAPPDATA\NVIDIA Corporation\Personal AI Router\logs\nvpair
 
 ```powershell
 C:\Users\<you>\miniconda3\envs\utils\python.exe -m pytest -q tests   # or: python -m pytest -q tests (env activated)
+```
+
+Dashboard (after `.\dashboard.ps1 setup -Fixture -Yes`), with its private Node.js:
+
+```powershell
+cd dashboard
+$env:PATH = (Get-ChildItem "$env:LOCALAPPDATA\PhotoSort\runtime\node-v*-win-x64" | Select-Object -Last 1).FullName + ";$env:PATH"
+npm run typecheck; npm test; npm run build   # security suite (20 tests, ~2 s), bundle scan for outside URLs
+cd ..
+.\dashboard.ps1 start -Fixture -NoOpen; .\dashboard.ps1 selftest -Fixture; .\dashboard.ps1 stop -Fixture
 ```

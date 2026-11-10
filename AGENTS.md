@@ -140,6 +140,39 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
+## Dashboard (`dashboard.ps1`, phase P0)
+
+Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify), `dashboard\shell` (Electron
+window), `dashboard\web` (React SPA), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
+
+- **Agents use fixture mode only:** `.\dashboard.ps1 <command> -Fixture -Yes`. Fixture mode has a synthetic
+  library, a fake PAIR on `127.0.0.1:47617`, its own data folder (`%LOCALAPPDATA%\PhotoSort\dashboard-fixture`)
+  and port 47616. Never start, open, restart or screenshot real mode (no `-Fixture`); the user does that.
+- In real mode, the only output you may read is `.\dashboard.ps1 status`, which shows counts and versions, no
+  paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard` (its `state.json` holds the token; the logs and the
+  window cache are the user's) or, from later phases, its thumbnails, events or job logs.
+- Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2.
+- Smoke test after changes:
+  - `setup -Fixture -Yes`, `start -Fixture -NoOpen`, `status -Fixture`, `selftest -Fixture` (8 PASS),
+    `stop -Fixture`;
+  - after changing `dashboard.ps1`, run it in both `pwsh` and `powershell` (5.1);
+  - keep `dashboard.ps1` ASCII-only, because 5.1 reads BOM-less files as ANSI.
+- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` and
+  `npm run build` (README "Tests"). The fixture tests are in pytest.
+- Invariants, all tested:
+  - only `server\src\localfetch.ts` opens connections: loopback, read-only PAIR paths, cloud models refused;
+  - every route declares an auth class;
+  - request bodies with unknown fields are refused (ajv `removeAdditional:false`);
+  - the built web app holds no outside URLs.
+  Never loosen the CSP, the window's request guard or the token handling.
+- Stop processes only through `dashboard.ps1 stop` (`-Force` if needed). It ends only process ids it has
+  verified; never stop node or electron by name.
+- Electron facts:
+  - the ESM entry must not top-level-await `app.whenReady()`, or the window hangs before `ready`;
+  - Chromium's `force_*_gpu` switches do nothing on Windows; the GPU comes from the per-app preference
+    `dashboard.ps1` writes (README "Graphics");
+  - this PC: NVIDIA RTX 4060 on AC, Intel Iris Xe on battery. That is drawing only, not inference.
+
 ## Known facts (as of 2026-11-10)
 
 - Only spark1 accepts SSH. AxiDvBb1, CVPRISM2, MinDvBb1, ErsDvBb1 have port 22 closed; the Mac-mini has
