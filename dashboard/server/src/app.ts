@@ -5,6 +5,10 @@ import fastifyStatic from '@fastify/static';
 import { installSecurity, requireAuthClass, type AuthClass } from './security.ts';
 import { SseHub } from './sse.ts';
 import { pairHealth } from './health.ts';
+import { DirRegistry } from './dirs.ts';
+import { JobManager } from './jobs.ts';
+import { registerJobRoutes } from './routes.ts';
+import { cachedProbe } from './pyinfo.ts';
 
 declare module 'fastify' {
   interface FastifyContextConfig {
@@ -25,14 +29,30 @@ export interface AppOptions {
   mode: Mode;
   version: string;
   configPath: string;
+  /** The dashboard's own data folder (jobs live in <dataDir>\jobs). */
+  dataDir: string;
+  /** The Python that runs photosort.py. */
+  python: string;
+  photosortDir: string;
+  /** Fixture mode: the only folders the UI may use. */
+  fixtureRoots?: string[];
+  /** Folders that may never be a job's source or destination. */
+  protectedDirs?: string[];
   webDist?: string;
   logger?: LineLogger;
   onShutdown?: (job: string) => void;
+  /** Tests: a stand-in for photosort.py, and how a reattached process is recognised. */
+  jobScript?: string;
+  isOurProcess?: (pid: number, jobId: string) => Promise<boolean>;
+  /** How long a "cancel the job, then stop" request waits for the job (dashboard.ps1 waits 180 s). */
+  shutdownWaitMs?: number;
 }
 
 export interface App {
   app: FastifyInstance;
   hub: SseHub;
+  jobs: JobManager;
+  dirs: DirRegistry;
 }
 
 const startedAt = new Date().toISOString();
@@ -56,6 +76,14 @@ export async function buildApp(opts: AppOptions): Promise<App> {
   requireAuthClass(app);
   installSecurity(app, { port: opts.port, token: opts.token });
   const hub = new SseHub();
+  const dirs = new DirRegistry({ fixtureRoots: opts.fixtureRoots, protectedDirs: opts.protectedDirs });
+  const jobs = new JobManager({
+    dataDir: opts.dataDir, python: opts.python, photosortDir: opts.photosortDir, configPath: opts.configPath, hub,
+    log: opts.logger, script: opts.jobScript, isOurProcess: opts.isOurProcess,
+  });
+  await jobs.init();
+  registerJobRoutes(app, jobs, dirs);
+  const pythonInfo = cachedProbe(opts.python, opts.photosortDir);
 
   app.get('/healthz', { config: { auth: 'public' } }, async () => ({ ok: true, version: opts.version, mode: opts.mode }));
 
@@ -68,7 +96,10 @@ export async function buildApp(opts: AppOptions): Promise<App> {
     uptimeS: Math.round(process.uptime()),
   }));
 
-  app.get('/api/health', { config: { auth: 'read' } }, async () => ({ pair: await pairHealth(opts.configPath) }));
+  app.get('/api/health', { config: { auth: 'read' } }, async () => {
+    const [pair, python] = await Promise.all([pairHealth(opts.configPath), pythonInfo()]);
+    return { pair, python };
+  });
 
   app.get('/api/stream', { config: { auth: 'read' } }, (req, reply) => {
     reply.hijack();
@@ -84,11 +115,24 @@ export async function buildApp(opts: AppOptions): Promise<App> {
         properties: { job: { type: 'string', enum: ['refuse', 'cancel', 'leave'] } },
       },
     },
-  }, async (req) => {
+  }, async (req, reply) => {
     const job = req.body?.job ?? 'refuse';
+    const active = jobs.active().sort((a, b) => Number(b.heavy) - Number(a.heavy));
+    if (job === 'refuse' && active.length) {
+      const j = active[0];
+      return reply.code(409).send({ error: 'a job is running', job: { kind: j.kind, done: j.done, total: j.total ?? '?' } });
+    }
+    // Jobs that have not started yet never outlive the dashboard.
+    for (const q of jobs.list().filter((j) => j.status === 'queued')) jobs.remove(q.id);
+    let finished = true;
+    if (job === 'cancel' && active.length) {
+      for (const j of active) jobs.cancel(j.id);
+      const wait = opts.shutdownWaitMs ?? 170_000;
+      finished = (await Promise.all(active.map((j) => jobs.waitFor(j.id, wait)))).every(Boolean);
+    }
     hub.send('sys', { type: 'shutdown' });
     setImmediate(() => opts.onShutdown?.(job));
-    return { stopping: true };
+    return { stopping: true, jobsFinished: finished };
   });
 
   const distDir = opts.webDist ? path.resolve(opts.webDist) : undefined;
@@ -110,5 +154,6 @@ export async function buildApp(opts: AppOptions): Promise<App> {
     return reply.sendFile(inside ? rel : 'index.html', { cacheControl: false });
   });
 
-  return { app, hub };
+  app.addHook('onClose', async () => { await jobs.close(); });
+  return { app, hub, jobs, dirs };
 }

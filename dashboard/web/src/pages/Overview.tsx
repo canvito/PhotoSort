@@ -1,13 +1,22 @@
-import type { ReactNode } from 'react';
-import { duration, type PairHealth } from '../api.ts';
+import { duration, type PairHealth, type PythonInfo } from '../api.ts';
 import type { Ctx } from '../App.tsx';
+import { RecentJobs } from '../components/forms.tsx';
+import { Row } from '../components/ui.tsx';
 
-function Row({ k, v, tone }: { k: string; v: ReactNode; tone?: 'ok' | 'warn' | 'bad' }) {
+function PythonCard({ py }: { py?: PythonInfo }) {
   return (
-    <div className="row">
-      <span className="k">{k}</span>
-      <span className={`v${tone ? ` ${tone}` : ''}`}>{v}</span>
-    </div>
+    <section className="card">
+      <h2>Python (runs PhotoSort)</h2>
+      {!py && <p className="muted">Checking…</p>}
+      {py && (
+        <>
+          <Row k="Python" v={py.ok ? py.version ?? 'ok' : 'not usable'} tone={py.ok ? 'ok' : 'bad'} />
+          {py.error && <p className="bad small">{py.error}</p>}
+          {py.ok && <Row k="iPhone photos (HEIC)" v={py.heic ? 'supported' : 'missing pillow-heif (pip install pillow-heif)'} tone={py.heic ? 'ok' : 'warn'} />}
+          {py.ok && <Row k="Videos" v={py.video ? 'supported' : 'missing PyAV (pip install av)'} tone={py.video ? 'ok' : 'warn'} />}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -52,6 +61,8 @@ export function Overview({ ctx, reloadHealth }: { ctx: Ctx; reloadHealth(): void
   return (
     <div className="grid">
       <PairCard pair={ctx.pair} error={ctx.pairError} reload={reloadHealth} />
+      <RecentJobs kinds={['sort', 'group', 'index', 'undo', 'apply']} />
+      <PythonCard py={ctx.python} />
       <section className="card">
         <h2>Dashboard</h2>
         {meta ? (
@@ -82,7 +93,7 @@ export function Overview({ ctx, reloadHealth }: { ctx: Ctx; reloadHealth(): void
       <section className="card">
         <h2>Coming next</h2>
         <ul className="plain">
-          <li><b>P1</b> Sort, Group and Index jobs with live progress, safe cancel, apply-preview and undo</li>
+          <li><b>P1 ✓</b> Sort, Group and Index jobs with live progress, safe stop, apply-preview and undo</li>
           <li><b>P2</b> Search and a fast gallery with thumbnails and video playback</li>
           <li><b>P3</b> Runs history, PAIR cluster view and the full privacy audit</li>
           <li><b>P4</b> Faces, settings editor and polish</li>

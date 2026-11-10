@@ -26,7 +26,7 @@ as any feature, config or procedure change.
   `%LOCALAPPDATA%\PhotoSort\search_index.sqlite`; keep it out of OneDrive and git. It can be rebuilt by
   running `index` again.
 - **File names and per-file results never reach you.** On the user's folders, `sort`, `group`, `index`,
-  `faces` and `undo` log one line per file (name plus bucket, MATCH/no or error) to stderr, and the finish
+  `faces`, `apply` and `undo` log one line per file (name plus bucket, MATCH/no or error) to stderr, and the finish
   report goes to stdout (counts only). Send stderr to a local log outside OneDrive and the repo, and show only
   the report. For example:
   `.\photosort.cmd sort "<folder>" 2> "$env:LOCALAPPDATA\PhotoSort\logs\sort-<yyyyMMdd-HHmm>.log"`
@@ -48,8 +48,19 @@ as any feature, config or procedure change.
 .\photosort.cmd check                                   # PAIR proxy up, gemma4:12b available, "Video support: yes"
 .\photosort.cmd sort "<folder>" --action report          # dry run
 .\photosort.cmd sort "<folder>"                          # move into bucket subfolders; prints finish report with duration
+.\photosort.cmd apply "<folder>\_photosort_journal.jsonl" # move exactly what the latest preview found (no model calls)
+.\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --dry-run  # what undo would move back; changes nothing
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" # revert the latest run
 ```
+
+Run control (`runctl.py`): `--events FILE` and `--cancel-file FILE` go before the command and are for the
+dashboard. Without them no events file is written; keep the terminal report the same either way (the finish
+event carries that same report). The `sort`, `group`, `apply`, `undo` and `index` loops call
+`runctl.checkpoint()` before each file, and a move plus its journal line sit in `runctl.no_interrupt()`, so
+Ctrl+C or a cancel never leaves a moved file unjournaled (exit 130). Runs take a folder lock (`move` or `read`)
+in `%LOCALAPPDATA%\PhotoSort\locks`; if a run refuses because of another run, tell the user rather than adding
+`--force`. `apply` moves only files unchanged since the preview (size, modified time, SHA-256); changed files
+stay put and the exit code is 1.
 
 When the user asks to sort a folder "with subfolders", run `sort "<root>" --recursive`: every photo and video
 from every subfolder goes into one flat set of bucket folders at the root. That is what the user wants; never
@@ -93,7 +104,8 @@ finish report).
   so it must stay limited to files near a match. Measured: 22/22 parties yes, 8/8 unrelated photos no, thing
   topics 7/7 targets yes and 77/77 others no. Journal entries carry `matched_by` and `near_match`.
 - `group` looks in all subfolders, including bucket folders, and skips group folders (marker
-  `_photosort_group.json`); `sort --recursive` skips them too. Undo with `undo` on the folder's journal.
+  `_photosort_group.json`); `sort --recursive` skips them too. After a preview, `apply` on the folder's journal
+  moves exactly the previewed matches without asking the model again. Undo with `undo` on the folder's journal.
 - Report: what was understood, group folder, files scanned / in range / other dates / no capture date, checked
   (and asked about the same occasion), found (photos, videos), errors, duration, files/min (all in the finish
   report).
@@ -140,33 +152,45 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
-## Dashboard (`dashboard.ps1`, phase P0)
+## Dashboard (`dashboard.ps1`, phase P1: jobs)
 
-Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify), `dashboard\shell` (Electron
-window), `dashboard\web` (React SPA), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
+Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify; jobs in `jobs.ts`, routes in
+`routes.ts`, folder picker in `dirs.ts`), `dashboard\shell` (Electron window), `dashboard\web` (React SPA; pages
+in `web\src\pages`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
 
 - **Agents use fixture mode only:** `.\dashboard.ps1 <command> -Fixture -Yes`. Fixture mode has a synthetic
-  library, a fake PAIR on `127.0.0.1:47617`, its own data folder (`%LOCALAPPDATA%\PhotoSort\dashboard-fixture`)
-  and port 47616. Never start, open, restart or screenshot real mode (no `-Fixture`); the user does that.
+  library, a fake PAIR on `127.0.0.1:47617` (the server starts it and it exits with the server), its own data
+  folder (`%LOCALAPPDATA%\PhotoSort\dashboard-fixture`) and port 47616. Never start, open, restart or screenshot
+  real mode (no `-Fixture`); the user does that.
 - In real mode, the only output you may read is `.\dashboard.ps1 status`, which shows counts and versions, no
-  paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard` (its `state.json` holds the token; the logs and the
-  window cache are the user's) or, from later phases, its thumbnails, events or job logs.
-- Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2.
+  paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard`: its `state.json` holds the token, the logs and window
+  cache are the user's, and `jobs\<id>\` (`job.json`, `events.jsonl`, `stdout.txt`, `stderr.txt`) holds file names
+  and per-file results.
+- Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2;
+  `stop` with a running job refuses (exit 1), and `stop -Yes` stops the job safely first.
 - Smoke test after changes:
   - `setup -Fixture -Yes`, `start -Fixture -NoOpen`, `status -Fixture`, `selftest -Fixture` (8 PASS),
     `stop -Fixture`;
+  - after job changes, also start a fixture sort preview through the API (token and port from the fixture
+    `state.json`; folder id from `GET /api/fs/roots`), wait for `ok`, then `stop -Fixture` while one runs;
   - after changing `dashboard.ps1`, run it in both `pwsh` and `powershell` (5.1);
   - keep `dashboard.ps1` ASCII-only, because 5.1 reads BOM-less files as ANSI.
-- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` and
-  `npm run build` (README "Tests"). The fixture tests are in pytest.
+- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` (44
+  tests, ~20 s, including `server\test\e2e.test.ts` with the real CLI and `fake_pair.py`) and `npm run build`
+  (README "Tests"). Python is found through `PHOTOSORT_PYTHON`, else `photosort.cmd`. The fixture and CLI tests
+  are in pytest.
 - Invariants, all tested:
   - only `server\src\localfetch.ts` opens connections: loopback, read-only PAIR paths, cloud models refused;
   - every route declares an auth class;
-  - request bodies with unknown fields are refused (ajv `removeAdditional:false`);
-  - the built web app holds no outside URLs.
+  - request bodies with unknown fields are refused (ajv `removeAdditional:false`); each job kind has a strict
+    parameter schema, folders travel as ids from the picker, and a cloud model name is refused;
+  - the built web app holds no outside URLs;
+  - jobs run `photosort.py` with `--events` and `--cancel-file`, detached, output to files, no shell; one heavy
+    job at a time; a cancel is a request, and a forced stop is allowed only 10 s later;
+  - a stopped move job leaves exactly one journal line per moved file (e2e test).
   Never loosen the CSP, the window's request guard or the token handling.
-- Stop processes only through `dashboard.ps1 stop` (`-Force` if needed). It ends only process ids it has
-  verified; never stop node or electron by name.
+- Stop processes only through `dashboard.ps1 stop` (`-Force` if needed) or a job's cancel. They end only process
+  ids they have verified; never stop node, electron or python by name.
 - Electron facts:
   - the ESM entry must not top-level-await `app.whenReady()`, or the window hangs before `ready`;
   - Chromium's `force_*_gpu` switches do nothing on Windows; the GPU comes from the per-app preference

@@ -13,6 +13,14 @@ const paths: Record<string, ReactElement> = {
   privacy: <><path d="M10 2.5 4 5v4.5c0 3.8 2.6 6.9 6 8 3.4-1.1 6-4.2 6-8V5z" /><path d="m7.5 10 1.8 1.8 3.4-3.6" /></>,
   shield: <><path d="M10 2.5 4 5v4.5c0 3.8 2.6 6.9 6 8 3.4-1.1 6-4.2 6-8V5z" /></>,
   blur: <><circle cx="10" cy="10" r="6.5" strokeDasharray="2 2" /><circle cx="10" cy="10" r="2.5" /></>,
+  folder: <><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h3.2l1.6 1.8h6.2A1.5 1.5 0 0 1 17 8.3v6.2a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5z" /></>,
+  up: <><path d="M10 16V5m0 0-4 4m4-4 4 4" /></>,
+  copy: <><rect x="7" y="7" width="9" height="9" rx="1.5" /><path d="M13 7V5.5A1.5 1.5 0 0 0 11.5 4h-6A1.5 1.5 0 0 0 4 5.5v6A1.5 1.5 0 0 0 5.5 13H7" /></>,
+  stop: <><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" /></>,
+  undo: <><path d="M7 5 3.5 8.5 7 12" /><path d="M3.5 8.5h8a4.5 4.5 0 0 1 0 9H9" /></>,
+  play: <><path d="M6.5 4.5v11l9-5.5z" /></>,
+  x: <><path d="m5 5 10 10M15 5 5 15" /></>,
+  chevron: <><path d="m8 5 5 5-5 5" /></>,
 };
 
 export function Icon({ name, size = 18 }: { name: keyof typeof paths | string; size?: number }) {

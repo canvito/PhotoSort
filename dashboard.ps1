@@ -627,7 +627,16 @@ function Show-Status {
             Say ('            {0} model {1}: {2}' -f $x.role, $x.name, $s)
         }
     } else { Say '  PAIR:     not reachable' }
-    Say '  Jobs:     none (job support arrives in phase P1)'
+    $jobs = Invoke-Server $st 'GET' '/api/jobs'
+    if ($jobs.Status -eq 200) {
+        $j = $jobs.Body | ConvertFrom-Json
+        $list = @($j.jobs)
+        $run = $list | Where-Object { $_.id -eq $j.running } | Select-Object -First 1
+        $now = 'none running'
+        if ($run -and $run.total) { $now = '{0} running ({1} of {2} done)' -f $run.kind, $run.done, $run.total }
+        elseif ($run) { $now = '{0} running' -f $run.kind }
+        Say ('  Jobs:     {0}, {1} queued, {2} in history' -f $now, $j.queued, $list.Count)
+    } else { Say '  Jobs:     unknown' }
     return 0
 }
 

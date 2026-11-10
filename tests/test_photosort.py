@@ -2,10 +2,13 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import stat
+import subprocess
 import sys
 import threading
+import time
 import zlib
 from datetime import date, datetime
 from fractions import Fraction
@@ -22,6 +25,7 @@ import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
 import group  # noqa: E402
 import media  # noqa: E402
+import runctl  # noqa: E402
 
 BUCKETS = {"people": "", "food": "", "screenshot_chat": "", "other": ""}
 CFG = {"model": "fake", "concurrency": 4, "buckets": BUCKETS}
@@ -29,8 +33,10 @@ CFG = {"model": "fake", "concurrency": 4, "buckets": BUCKETS}
 
 @pytest.fixture(autouse=True)
 def private_search_index(tmp_path_factory, monkeypatch):
-    """Point the default search index at a temp folder so tests never touch the real one."""
+    """Point the default search index (and the folder locks) at a temp folder so tests never touch the real ones."""
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path_factory.mktemp("appdata")))
+    yield
+    runctl.configure()  # events off and no cancel left over for the next test
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"])
@@ -915,3 +921,244 @@ def test_files_taken_near_a_match_or_the_existing_group_are_asked_if_from_the_sa
     any_day = FakeGrouper(reading(date_from="", date_to=""))
     r = photosort.group_folder(CFG, tmp_path, "birthday parties", "report", classifier=any_day, today=TODAY)
     assert any_day.same_event_checked == ["guests_later.jpg"] and r["same_event_found"] == 1
+
+# ---------- run control: events, cancel, preview then apply, locks (what the dashboard relies on) ----------
+
+def events_in(path):
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+def test_events_report_each_file_only_after_its_journal_line(tmp_path, monkeypatch):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    make_photos(photos, ["selfie.jpg", "lunch.jpg", "chat.png", "broken.jpg"])
+    runctl.configure(tmp_path / "events.jsonl")
+    journal = photos / photosort.JOURNAL_NAME
+    lines_when_reported = []
+    real_emit = runctl.emit
+
+    def spy(type_, **fields):
+        if type_ == "item":
+            lines_when_reported.append((fields["n"], len(journal.read_text().splitlines())))
+        real_emit(type_, **fields)
+
+    monkeypatch.setattr(runctl, "emit", spy)
+    s = photosort.sort_folder(CFG, photos, action="move", classifier=FakeClassifier())
+    monkeypatch.setattr(runctl, "emit", real_emit)
+    more = tmp_path / "more"
+    more.mkdir()
+    make_photos(more, ["cat.jpg", "beach.jpg"])
+    photo_search.index_folder(CFG, more, FakeSearchClient(), photosort.IMAGE_EXTS)
+
+    assert lines_when_reported == [(n, n) for n in range(1, 5)]
+    ev = events_in(tmp_path / "events.jsonl")
+    assert [e["seq"] for e in ev] == list(range(1, len(ev) + 1)) and {e["v"] for e in ev} == {runctl.SCHEMA}
+    sort_ev, index_ev = ev[:6], ev[6:]
+    assert [(e["type"], e.get("name")) for e in sort_ev[:2]] == [("phase", "scan"), ("phase", "sort")]
+    assert (sort_ev[1]["total"], sort_ev[1]["run_id"], sort_ev[1]["journal"]) == (4, s["run_id"], str(journal))
+    items = {Path(e["path"]).name: e for e in sort_ev[2:]}
+    assert items["lunch.jpg"]["result"] == {"bucket": "food", "confidence": 0.8,
+                                            "dst": str(photos / "food" / "lunch.jpg")}
+    assert "model unavailable" in items["broken.jpg"]["error"]
+    assert [(e["type"], e.get("name")) for e in index_ev] == [
+        ("phase", "scan"), ("phase", "hash"), ("phase", "caption"), ("item", None), ("item", None)]
+    assert {e["result"]["status"] for e in index_ev[3:]} == {"captioned"} and index_ev[2]["total"] == 2
+
+
+class CliClassifier:
+    """What `photosort sort` builds instead of the PAIR client: the third file asks to cancel, as the dashboard's
+    Cancel button does, while its own request is still running."""
+
+    def __init__(self, cfg):
+        self.calls, self.cancel_file = 0, cfg["test_cancel_file"]
+
+    def preflight(self):
+        return ["fake"]
+
+    def classify(self, path):
+        self.calls += 1
+        if self.calls == 3:
+            time.sleep(0.3)
+            Path(self.cancel_file).write_text("cancel")
+            time.sleep(1.0)
+        return "other", 0.5
+
+
+def cli_config(tmp_path, **extra):
+    cfg = {"base_url": "http://127.0.0.1:11434", "model": "gemma4:12b", "concurrency": 1, "action": "move",
+           "buckets": BUCKETS, **extra}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(cfg))
+    return path
+
+
+def test_cancel_stops_before_the_next_file_and_every_moved_file_is_journaled(tmp_path, monkeypatch, capsys):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    names = [f"img{i}.jpg" for i in range(6)]
+    make_photos(photos, names)
+    cancel = tmp_path / "job" / "cancel"
+    cancel.parent.mkdir()
+    monkeypatch.setattr(photosort, "Classifier", CliClassifier)
+    config = cli_config(tmp_path, test_cancel_file=str(cancel))
+
+    code = photosort.main(["--config", str(config), "--events", str(tmp_path / "events.jsonl"),
+                           "--cancel-file", str(cancel), "sort", str(photos)])
+
+    assert code == 130
+    moved = sorted(p.name for p in (photos / "other").iterdir())
+    assert moved == names[:2] and sorted(p.name for p in photos.glob("*.jpg")) == names[2:]
+    journaled = [e for e in map(json.loads, (photos / photosort.JOURNAL_NAME).open()) if e["dst"]]
+    assert sorted(Path(e["dst"]).name for e in journaled) == moved
+    ev = events_in(tmp_path / "events.jsonl")
+    assert ev[0]["type"] == "run_start" and ev[0]["cmd"] == "sort" and ev[0]["params"]["source"] == str(photos)
+    assert any(e["type"] == "warning" and "cancel requested" in e["message"] for e in ev)
+    assert (ev[-1]["type"], ev[-1]["status"], ev[-1]["exit_code"]) == ("finish", "cancelled", 130)
+    assert "summary" not in ev[-1] and "=== PhotoSort" not in capsys.readouterr().out
+    runctl.configure()  # a new process in real use
+    assert photosort.undo(photos / photosort.JOURNAL_NAME)["restored"] == 2
+
+
+def test_cli_finish_event_carries_the_summary_and_the_same_report_the_terminal_shows(tmp_path, monkeypatch,
+                                                                                       capsys):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    make_photos(photos, ["a.jpg", "b.jpg"])
+    monkeypatch.setattr(photosort, "Classifier", CliClassifier)
+    config = cli_config(tmp_path, test_cancel_file=str(tmp_path / "unused"))
+
+    assert photosort.main(["--config", str(config), "sort", str(photos), "--action", "report"]) == 0
+    plain = capsys.readouterr().out
+    assert photosort.main(["--config", str(config), "--events", str(tmp_path / "ev.jsonl"),
+                           "sort", str(photos), "--action", "report"]) == 0
+    finish = events_in(tmp_path / "ev.jsonl")[-1]
+    assert (finish["status"], finish["summary"]["sorted"]) == ("ok", 2) and finish["report"] in capsys.readouterr().out
+    assert "Duration" in plain and [p.name for p in tmp_path.glob("*.jsonl")] == ["ev.jsonl"]
+
+
+def test_ctrl_c_during_a_move_waits_until_its_journal_line_is_written():
+    before, steps = signal.getsignal(signal.SIGINT), []
+    with pytest.raises(KeyboardInterrupt):
+        with runctl.no_interrupt():
+            signal.raise_signal(signal.SIGINT)
+            steps.append("moved and journaled")
+    assert steps == ["moved and journaled"] and signal.getsignal(signal.SIGINT) is before
+
+
+def test_undo_dry_run_lists_what_undo_does_and_an_interrupted_undo_finishes_next_time(tmp_path, monkeypatch):
+    names = ["selfie.jpg", "lunch.jpg", "chat.png"]
+    make_photos(tmp_path, names)
+    s = photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier())
+    journal = tmp_path / photosort.JOURNAL_NAME
+    before = journal.read_text()
+
+    dry = photosort.undo_run(journal, dry_run=True)
+
+    assert journal.read_text() == before and not any((tmp_path / n).exists() for n in names)
+    assert sorted(Path(src).name for src, _ in dry["restored_files"]) == sorted(names)
+    report = photosort.format_undo_report(dry)
+    assert "3 files would be moved back" in report and "Would move back" in report and "Duration" in report
+
+    real_checkpoint, calls = runctl.checkpoint, []
+
+    def cancel_on_second_file():
+        calls.append(1)
+        if len(calls) == 2:
+            raise runctl.Cancelled()
+
+    monkeypatch.setattr(runctl, "checkpoint", cancel_on_second_file)
+    with pytest.raises(KeyboardInterrupt):
+        photosort.undo_run(journal)
+    monkeypatch.setattr(runctl, "checkpoint", real_checkpoint)
+    assert sum((tmp_path / n).exists() for n in names) == 1
+
+    rest = photosort.undo_run(journal)
+
+    assert (rest["run_id"], rest["restored"], rest["already_restored"], rest["problems"]) == (s["run_id"], 2, 1, 0)
+    assert all((tmp_path / n).exists() for n in names) and not (tmp_path / "food").exists()
+    assert "1 files were moved back by an earlier, interrupted undo" in photosort.format_undo_report(rest)
+    with pytest.raises(ValueError):
+        photosort.undo(journal)
+
+
+def test_apply_moves_exactly_the_previewed_files_and_leaves_changed_ones_alone(tmp_path):
+    make_photos(tmp_path, ["selfie.jpg", "lunch.jpg", "chat.png", "broken.jpg"])
+    preview = photosort.sort_folder(CFG, tmp_path, action="report", classifier=FakeClassifier())
+    (tmp_path / "chat.png").write_bytes(b"edited after the preview")
+    (tmp_path / "late.jpg").write_bytes(b"added after the preview")
+    journal = tmp_path / photosort.JOURNAL_NAME
+
+    s = photosort.apply_preview(CFG, journal)
+
+    assert (s["applied_from"], s["kind"], s["planned"], s["applied"], s["changed"], s["errors"]) == \
+        (preview["run_id"], "sort", 3, 2, 1, 0)
+    assert (tmp_path / "people" / "selfie.jpg").exists() and (tmp_path / "food" / "lunch.jpg").exists()
+    assert all((tmp_path / n).exists() for n in ["chat.png", "broken.jpg", "late.jpg"])
+    report = photosort.format_apply_report(s)
+    assert "chat.png: changed since the preview" in report and "Duration" in report
+    with pytest.raises(ValueError, match="already applied"):
+        photosort.apply_preview(CFG, journal, preview["run_id"])
+
+    assert photosort.undo(journal)["restored"] == 2  # an apply is undone like any other run
+    assert photosort.apply_preview(CFG, journal)["applied"] == 2  # and then the preview can be applied again
+
+
+def test_apply_a_group_preview_makes_the_group_folder_without_asking_the_model_again(tmp_path):
+    for name, when in {"party_cake.jpg": "2026:11:08 15:00:00", "party_games.jpg": "2026:11:08 15:10:00",
+                       "cake.jpg": "2026:11:08 16:00:00"}.items():
+        photo_taken(tmp_path / name, when)
+    fake = FakeGrouper(reading())
+    r = photosort.group_folder(CFG, tmp_path, "birthday party on last Sunday", "report", classifier=fake, today=TODAY)
+    target = tmp_path / "Birthday party 2026-11-08"
+    assert r["matched"] == 2 and not target.exists()
+    asked = len(fake.checked)
+
+    s = photosort.apply_preview(CFG, tmp_path / photosort.JOURNAL_NAME)
+
+    assert (s["kind"], s["applied"], s["group"], len(fake.checked)) == ("group", 2, str(target), asked)
+    assert {p.name for p in target.iterdir()} == {"party_cake.jpg", "party_games.jpg", group.GROUP_MARKER}
+    marker = json.loads((target / group.GROUP_MARKER).read_text())
+    assert (marker["topic"], marker["dates"], marker["run_id"]) == ("a birthday party", ["2026-11-08"] * 2,
+                                                                    s["run_id"])
+    assert photosort.undo(tmp_path / photosort.JOURNAL_NAME)["restored"] == 2 and not target.exists()
+
+
+def test_runs_that_move_files_refuse_overlapping_folders_unless_forced(tmp_path, capsys):
+    photos = tmp_path / "photos"
+    (photos / "2026").mkdir(parents=True)
+    root = runctl.locks_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        def held_by_other(mode):
+            (root / "other.json").write_text(json.dumps({
+                "id": "other", "pid": other.pid, "pid_started": runctl._process_start(other.pid), "cmd": "sort",
+                "mode": mode, "folders": runctl.minimal_folders([photos]), "since": "2026-11-10T09:00:00"}))
+
+        held_by_other("move")
+        with pytest.raises(runctl.LockError, match="another PhotoSort run .sort, process"):
+            with runctl.folder_lock("index", "read", [photos / "2026"]):
+                pass
+        with runctl.folder_lock("sort", "move", [tmp_path / "elsewhere"]):
+            pass
+        with runctl.folder_lock("sort", "move", [photos], force=True) as mine:
+            assert (root / f"{mine['id']}.json").exists()
+        assert not (root / f"{mine['id']}.json").exists()
+
+        held_by_other("read")
+        with runctl.folder_lock("index", "read", [photos]):
+            pass  # two runs that only read are fine
+        with pytest.raises(runctl.LockError):
+            with runctl.folder_lock("group", "move", [tmp_path]):  # a parent folder overlaps too
+                pass
+        config = cli_config(tmp_path)
+        assert photosort.main(["--config", str(config), "--events", str(tmp_path / "ev.jsonl"),
+                               "group", str(tmp_path), "party"]) == 2
+        ev = events_in(tmp_path / "ev.jsonl")
+        assert [e["kind"] for e in ev if e["type"] == "error"] == ["locked"] and ev[-1]["status"] == "failed"
+    finally:
+        other.kill()
+        other.wait()
+    with runctl.folder_lock("sort", "move", [photos]):
+        pass  # the lock of a process that has ended is ignored
+    assert not (root / "other.json").exists()

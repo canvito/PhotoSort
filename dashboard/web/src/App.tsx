@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, Route, Switch, useLocation } from 'wouter';
-import { useServerEvents, usePoll, useShellInfo, type Meta, type PairHealth, type ShellInfo } from './api.ts';
+import { useServerEvents, usePoll, useShellInfo, type Meta, type PairHealth, type PythonInfo, type ShellInfo } from './api.ts';
+import { JobDock } from './components/JobDock.tsx';
 import { Icon } from './icons.tsx';
+import { JobsContext, useJobListSource } from './jobs.ts';
+import { GroupPage } from './pages/Group.tsx';
+import { JobPage } from './pages/Job.tsx';
 import { Overview } from './pages/Overview.tsx';
 import { Placeholder } from './pages/Placeholder.tsx';
 import { Privacy } from './pages/Privacy.tsx';
+import { RunsPage } from './pages/Runs.tsx';
+import { SearchPage } from './pages/Search.tsx';
+import { SortPage } from './pages/Sort.tsx';
 
 export const NAV = [
   { path: '/', label: 'Overview', icon: 'overview' },
@@ -22,8 +29,15 @@ export interface Ctx {
   meta?: Meta;
   pair?: PairHealth;
   pairError?: string;
+  python?: PythonInfo;
   shell?: ShellInfo;
   connected: boolean;
+}
+
+/** The nav entry a location belongs to; a job page belongs to Runs. */
+function navOf(location: string): (typeof NAV)[number] | undefined {
+  if (location.startsWith('/jobs/')) return NAV.find((n) => n.path === '/runs');
+  return NAV.find((n) => n.path === location);
 }
 
 function pairState(c: Ctx): { tone: 'ok' | 'warn' | 'bad'; text: string } {
@@ -37,7 +51,8 @@ function pairState(c: Ctx): { tone: 'ok' | 'warn' | 'bad'; text: string } {
 export function App() {
   const [location] = useLocation();
   const meta = usePoll<Meta>('/api/meta', 30000);
-  const health = usePoll<{ pair: PairHealth }>('/api/health', 10000);
+  const health = usePoll<{ pair: PairHealth; python?: PythonInfo }>('/api/health', 10000);
+  const jobs = useJobListSource();
   const [shell, setShell] = useShellInfo();
   const [stopped, setStopped] = useState(false);
   const [blur, setBlur] = useState(() => localStorage.getItem('blur') === '1');
@@ -58,14 +73,16 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const ctx: Ctx = { meta: meta.data, pair: health.data?.pair, pairError: health.error, shell, connected };
+  const ctx: Ctx = { meta: meta.data, pair: health.data?.pair, pairError: health.error, python: health.data?.python, shell, connected };
   const pill = pairState(ctx);
+  const here = navOf(location);
   const fixture = meta.data?.mode === 'fixture';
   const toggleProtection = async () => {
     if (window.photosort && shell) setShell(await window.photosort.setProtection(!shell.protection));
   };
 
   return (
+    <JobsContext value={jobs}>
     <div className="app">
       <nav className="nav" aria-label="Pages">
         <div className="brand">
@@ -73,7 +90,8 @@ export function App() {
           PhotoSort
         </div>
         {NAV.map((n) => (
-          <Link key={n.path} href={n.path} className={`nav-item${location === n.path ? ' active' : ''}`}>
+          <Link key={n.path} href={n.path} className={`nav-item${here === n ? ' active' : ''}`}
+            aria-current={here === n ? 'page' : undefined}>
             <Icon name={n.icon} />
             <span>{n.label}</span>
           </Link>
@@ -85,7 +103,7 @@ export function App() {
       </nav>
       <div className="main">
         <header className="topbar">
-          <h1>{NAV.find((n) => n.path === location)?.label ?? 'PhotoSort'}</h1>
+          <h1>{location.startsWith('/jobs/') ? 'Run' : here?.label ?? 'PhotoSort'}</h1>
           <div className="topbar-right">
             {fixture && <span className="badge fixture" title="Synthetic test data only">FIXTURE</span>}
             <Link href="/" className={`pill ${pill.tone}`} title={ctx.pair?.error ?? ctx.pairError ?? 'Local NVIDIA PAIR proxy'}>
@@ -112,17 +130,20 @@ export function App() {
           <Switch>
             <Route path="/"><Overview ctx={ctx} reloadHealth={health.reload} /></Route>
             <Route path="/privacy"><Privacy ctx={ctx} /></Route>
-            <Route path="/sort"><Placeholder page="sort" /></Route>
-            <Route path="/group"><Placeholder page="group" /></Route>
-            <Route path="/search"><Placeholder page="search" /></Route>
+            <Route path="/sort"><SortPage /></Route>
+            <Route path="/group"><GroupPage /></Route>
+            <Route path="/search"><SearchPage /></Route>
             <Route path="/faces"><Placeholder page="faces" /></Route>
-            <Route path="/runs"><Placeholder page="runs" /></Route>
+            <Route path="/runs"><RunsPage /></Route>
+            <Route path="/jobs/:id">{(p) => <JobPage key={p.id} id={p.id} />}</Route>
             <Route path="/cluster"><Placeholder page="cluster" /></Route>
             <Route path="/settings"><Placeholder page="settings" /></Route>
             <Route><div className="card"><h2>Not found</h2><p>This page does not exist. <Link href="/">Back to Overview</Link></p></div></Route>
           </Switch>
         </main>
+        <JobDock />
       </div>
     </div>
+    </JobsContext>
   );
 }

@@ -41,6 +41,7 @@ if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('--port must be
 const dataDir = values['data-dir'] ? path.resolve(values['data-dir']) : fail('--data-dir is required');
 const configPath = values.config ? path.resolve(values.config) : fail('--config is required');
 const photosortDir = path.resolve(values['photosort-dir'] ?? path.join(dashDir, '..'));
+const python = values.python ?? fail('--python is required');
 if (isUnderOneDrive(dataDir)) fail('the dashboard data folder must not be inside OneDrive');
 
 const version = (JSON.parse(readFileSync(path.join(dashDir, 'package.json'), 'utf8')) as { version: string }).version;
@@ -63,7 +64,6 @@ if (mode === 'fixture') {
   // Fixture mode never touches the real PAIR cluster: a deterministic fake Ollama answers instead.
   const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { base_url: string };
   const fakePort = new URL(cfg.base_url).port;
-  const python = values.python ?? fail('--python is required in fixture mode');
   fakePair = spawn(python, [path.join(photosortDir, 'tests', 'fake_pair.py'), '--port', fakePort, '--parent-pid', String(process.pid)],
     { stdio: 'ignore', windowsHide: true, shell: false });
   fakePair.on('error', (e) => logger.error({ msg: 'fake PAIR failed to start', err: e.message }));
@@ -78,6 +78,7 @@ async function shutdown(reason: string): Promise<void> {
   logger.info({ msg: 'stopping', reason });
   setTimeout(() => process.exit(0), 5000).unref();
   hub.close();
+  // Closing the app also stops watching jobs; running jobs keep going and are picked up again on the next start.
   await app.close().catch(() => undefined);
   fakePair?.kill();
   writeState({ running: false, mode, port, version, stoppedAt: new Date().toISOString() });
@@ -90,6 +91,12 @@ const { app, hub } = await buildApp({
   mode,
   version,
   configPath,
+  dataDir,
+  python,
+  photosortDir,
+  // Fixture mode only ever shows the generated fixture library.
+  fixtureRoots: mode === 'fixture' ? [path.join(dataDir, 'library')] : undefined,
+  protectedDirs: [dataDir, path.join(process.env.LOCALAPPDATA ?? path.dirname(dataDir), 'PhotoSort'), photosortDir],
   webDist: path.join(dashDir, 'web', 'dist'),
   logger,
   onShutdown: (job) => void shutdown(`api (job=${job})`),

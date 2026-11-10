@@ -13,7 +13,7 @@ import os
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
@@ -21,6 +21,7 @@ from typing import Callable, Iterable
 import numpy as np
 import requests
 
+import runctl
 from local_only import require_local_models, require_loopback
 from media import is_video, video_jpegs
 
@@ -160,6 +161,8 @@ class PairSearchClient:
         instead, if given: at temperature 0 the same request would loop the same way again."""
         err = "no attempts"
         for attempt in range(self.retries):
+            if runctl.cancelled():
+                raise SearchError("cancelled")
             try:
                 r = self._session().post(f"{self.url}{endpoint}", json=body, timeout=self.timeout)
                 r.raise_for_status()
@@ -170,7 +173,7 @@ class PairSearchClient:
                 if isinstance(e, ReplyCutOff) and if_cut_off is not None:
                     body = if_cut_off
                     continue
-                time.sleep(min(2 ** attempt, 10))
+                runctl.sleep(min(2 ** attempt, 10))
         raise SearchError(err)
 
     def caption(self, path: Path) -> dict:
@@ -271,6 +274,7 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
     if not source.is_dir():
         raise FileNotFoundError(f"source folder not found: {source}")
     exts = {e.lower() for e in image_exts}
+    runctl.emit("phase", name="scan")
     files = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in exts)
     current = {str(p) for p in files}
     current_nc = {os.path.normcase(p) for p in current}
@@ -304,11 +308,16 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
 
     ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="photoindex")
     try:
-        hashes = dict(zip([p for p, _ in todo], ex.map(lambda t: _try_sha256(t[0]), todo)))
+        runctl.emit("phase", name="hash", total=len(todo), files=len(files), unchanged=unchanged)
+        hashes = {}
+        for (p, _), sha in zip(todo, ex.map(lambda t: _try_sha256(t[0]), todo)):
+            runctl.checkpoint()
+            hashes[p] = sha
         pending = []
         for p, st in todo:
             if hashes[p] is None:
                 counts["errors"] += 1
+                runctl.emit("item", phase="hash", path=str(p), error="cannot read the file")
                 continue
             match = db.execute(
                 "SELECT caption, scene, objects, text, people_count, vec_visual, vec_text FROM photos "
@@ -323,16 +332,22 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
             else:
                 pending.append((p, st))
         db.commit()
+        runctl.emit("phase", name="caption", total=len(pending), reused=counts["reused"])
         futures = {ex.submit(_analyze, client, p): (p, st) for p, st in pending}
-        for n, fut in enumerate(as_completed(futures), 1):
+        for n, fut in enumerate(runctl.completed(futures), 1):
+            runctl.checkpoint()
             p, st = futures[fut]
             try:
                 store(p, st, hashes[p], fut.result())
                 counts["captioned"] += 1
                 log.info("[%d/%d] indexed %s", n, len(pending), p.name)
+                runctl.emit("item", phase="caption", n=n, total=len(pending), path=str(p),
+                            result={"status": "captioned"})
             except Exception as e:  # keep going; the photo is retried on the next index run
                 counts["errors"] += 1
                 log.warning("[%d/%d] FAILED %s: %s: %s", n, len(pending), p.name, type(e).__name__, str(e)[:200])
+                runctl.emit("item", phase="caption", n=n, total=len(pending), path=str(p),
+                            error=f"{type(e).__name__}: {str(e)[:200]}")
             if n % 10 == 0:
                 db.commit()
         db.commit()

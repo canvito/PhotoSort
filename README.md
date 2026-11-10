@@ -18,8 +18,9 @@ namely the bucket and group folders, the moved files, `_photosort_journal.jsonl`
 confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive.
 See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
-A desktop window, the [Dashboard](#dashboard-dashboardps1), is being added in phases; start it with
-`.\dashboard.ps1` and stop it with `.\dashboard.ps1 stop`.
+The [Dashboard](#dashboard-dashboardps1), a desktop window, runs sort, group, index, apply and undo for you, with
+live progress (search, browsing and faces come in later phases). Start it with `.\dashboard.ps1` and stop it with
+`.\dashboard.ps1 stop`.
 
 ## Setup (once)
 
@@ -62,7 +63,12 @@ cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
 .\photosort.cmd group "<folder>" "birthday party on last Sunday" --action report
 .\photosort.cmd group "<folder>" "birthday party on last Sunday"
 
-# Undo the latest sort or group run in a folder (moves files back, removes empty bucket or group folders)
+# Preview, then move exactly what the preview found (the model is not asked again)
+.\photosort.cmd sort "<folder>" --action report
+.\photosort.cmd apply "<folder>\_photosort_journal.jsonl"
+
+# Undo the latest sort, group or apply run in a folder (moves files back, removes empty bucket or group folders)
+.\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --dry-run   # list what would move back; changes nothing
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl"
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --run-id 20261109-111724-591f86
 ```
@@ -93,7 +99,21 @@ Behavior:
   errors, other files left in place, the **duration** (whole run: start, preflight, scan, classify, move;
   with start/finish times), speed in files/min, the journal path and a per-bucket count. `-v` also logs the
   raw JSON summary.
-- Exit code: 0 = all sorted, 1 = some files failed, 2 = setup/config error.
+- Exit code: 0 = all sorted, 1 = some files failed, 2 = setup/config error, 130 = stopped (Ctrl+C).
+- **Stopping safely:** Ctrl+C stops a run at the next file. A file move and its journal line always finish
+  together, so a stopped run never leaves a file half-moved or moved without a journal line; `undo` reverts what
+  was done, and the rest stay where they were.
+- **`apply`** takes a preview (`sort` or `group` with `--action report`; the latest one in the journal not yet
+  applied, or `--run-id`) and moves (or `--action copy`) exactly the files it listed into the folders it chose,
+  without asking the model again. A preview records each file's size, modified time and SHA-256; a file that
+  changed or is gone since then is left alone and counted as `changed` (exit code 1). `undo` reverts an apply
+  like any other run.
+- **One run per folder:** a run that moves or copies files (`sort`, `group`, `apply`, `undo`) refuses to start while
+  another PhotoSort run uses an overlapping folder, and runs that only read (`--action report`, `index`, `faces`,
+  `undo --dry-run`) refuse while one is moving files there. The message names the other run; `--force` runs
+  anyway. Lock files live in `%LOCALAPPDATA%\PhotoSort\locks` and are ignored once their process has ended.
+- `--events FILE` and `--cancel-file FILE` (before the command) are for the dashboard: progress as JSON lines,
+  and a safe stop once the file exists. Without them nothing changes in the output.
 
 ## Videos
 
@@ -419,10 +439,10 @@ pack is intended for personal/non-commercial use; review the model license befor
 
 ## Dashboard (`dashboard.ps1`)
 
-A desktop window for PhotoSort, built in phases. **Now (P0):** the window, its local server, PAIR health and
-the privacy checks. The other pages show the matching CLI command until their phase lands: P1 runs sort,
-group, index and undo as jobs; P2 adds search, browsing and thumbnails; P3 adds runs, the cluster view and live
-privacy checks; P4 adds faces and settings.
+A desktop window for PhotoSort, built in phases. **Now (P1):** the window, its local server, PAIR health, the
+privacy checks, and **jobs**: sort, group, index, apply and undo run from the window with live progress. Later
+phases: P2 adds search, browsing and thumbnails; P3 the full runs history, the cluster view and live privacy
+checks; P4 faces and settings. Until then those pages show the matching CLI command.
 
 ```powershell
 cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
@@ -444,12 +464,43 @@ It works in PowerShell 7 and Windows PowerShell 5.1. If scripts are blocked, run
 | `-Port N` | use this port (default 47615, else the next free one up to 47625) |
 | `-Yes` | allow installs without asking (needed when nobody can answer, e.g. scripts) |
 | `-Force` | `stop`: end the server if it doesn't stop within 10 s (never while a job runs) |
-| `-LeaveJobRunning` | `stop`: stop the dashboard but let a running job finish (P1) |
+| `-LeaveJobRunning` | `stop`: stop the dashboard but let a running job finish |
 | `-Rebuild`, `-Update` | rebuild the web app; update Electron |
 | `-UseSystemNode`, `-Python PATH` | use the installed Node.js 24–26; use another Python |
 | `-Fixture` | synthetic test library, fake PAIR, own data folder and port 47616 (for tests and agents) |
 
 Exit codes: 0 done, 1 failed, 2 a needed install is missing or was declined, 3 not running.
+
+### Jobs
+
+Each page fills in a form and starts the same `photosort.py` command you would type; **Copy CLI command** shows
+it. Folders come from a picker (Pictures, Videos, OneDrive Pictures, Desktop, Downloads and each drive) or a
+pasted path. It refuses whole drives, your whole user folder, system and app-data folders, network paths and
+PhotoSort's own folders.
+
+| Page | What it does |
+|---|---|
+| **Sort** | Preview, move or copy into buckets; optional destination, subfolders, and advanced limit, parallel requests, model and `--force` |
+| **Group** | A plain-language request (up to 500 characters, with examples); advanced folder name, From/To dates (To empty = today), photos/videos/both |
+| **Index** | Builds or refreshes the search index (unchanged files are skipped). Searching itself arrives in P2; until then use `.\photosort.cmd search` |
+| **Runs** | Every job with its result, filtered by kind; **Undo a folder's last run** previews undoing the latest run in that folder's journal |
+| **Job** (`/jobs/<id>`) | Live progress, the per-file list (virtualized), what a group request understood, the finish report and its duration, and the next step: **Move these N files** or **Copy instead** after a preview, **Undo this run…** (a preview), then **Move N files back now**, or **Edit and run again**. A refused group request or a locked folder offers fixes (**Retry with photos only**, **Set the dates…**, **Run anyway…**) |
+
+- **One heavy job at a time.** Jobs that read many files or move them wait in a queue (a dock at the bottom
+  shows it, and toasts report each finish); **Remove from queue** drops a waiting one. Undo previews run at once.
+- **Moves always go preview first:** move or copy asks for confirmation; applying a preview moves exactly what it
+  listed without asking the model again; undo is offered as a preview, then a move.
+- **Stopping a job:** **Stop safely** asks the run to stop at the next file (the safe stop described in
+  [Usage](#usage)). **Force stop** is offered only 10 s later, because it ends the process at once.
+- **Survives restarts:** the job's Python process runs on its own, so closing the window or stopping the server
+  (`stop -LeaveJobRunning`) doesn't end it; the next start reattaches. `stop` while a job runs asks first:
+  `-Yes` stops the job safely, then the dashboard (up to 180 s). A job whose process vanished is shown as
+  *interrupted*.
+- Each job lives in `<data folder>\jobs\<id>\`: `job.json` (status, counts, summary), `events.jsonl` (the
+  `--events` stream), `stdout.txt`/`stderr.txt` (the CLI's own output, with file names, as in a terminal) and
+  `cancel` (the stop request). Jobs are kept for 90 days, at most 1,000.
+- The Python must be PhotoSort's env (`photosort.cmd`'s `PY`, or `-Python`). The Overview page shows whether it
+  has HEIC (`pillow-heif`) and video (`av`) support.
 
 **What setup installs** (it asks first; each step re-runs only when its input changed):
 - Node.js 26 LTS, a private copy in `%LOCALAPPDATA%\PhotoSort\runtime` (zip from nodejs.org, checked against
@@ -486,8 +537,10 @@ model runs on this PC.
   - `state.json`: the port, process id and this run's token;
   - `shell.json`: the window's process;
   - `logs\`: `server-*`, `shell-*` and `setup-*` logs, which hold events and counts, no file names;
+  - `jobs\<id>\`: each job's record, events and CLI output (these do hold file names, like a terminal would);
   - `shell\`: the window's browser cache.
 - `%LOCALAPPDATA%\PhotoSort\dashboard-fixture`: the same for `-Fixture`, plus the synthetic `library\`.
+- `%LOCALAPPDATA%\PhotoSort\locks`: the CLI's folder locks (see [Usage](#usage)), shared by both modes.
 - `dashboard\node_modules` and `dashboard\web\dist` are git-ignored.
 
 **Measured on this PC (2026-11-10):**
@@ -500,7 +553,10 @@ model runs on this PC.
 | Stop | 1.3–2.9 s (target ≤ 5 s) |
 | Opening the window | ~3.5 s |
 | `status` | 2.4 s (PowerShell 7), 3.5 s (5.1) |
-| Window self-test | 4.0–4.3 s |
+| Window self-test | 3.5–4.3 s |
+| A file's progress reaching the window (CLI event to page, fixture run) | median 191 ms, p95 285 ms (target ≤ 500 ms) |
+| Fixture sort preview, 50 files, fake PAIR | 1.9 s |
+| `stop` while a job runs, with `-Yes` (stops the job safely first) | 1.0 s |
 
 **Troubleshooting:**
 - "The server did not start": read `logs\server-crash.log` or `logs\server-<date>.log` in the data folder.
@@ -608,9 +664,11 @@ videos) and found **no photo, video, frame, face or caption sent to a cloud mode
   `search --paths-only` output. Agents now keep those lines in a local log (see `AGENTS.md`).
 
 **Since the audit, the dashboard** (see [Dashboard](#dashboard-dashboardps1)) keeps its data in
-`%LOCALAPPDATA%\PhotoSort\dashboard`: state, logs without file names, and the window's cache. Its server
-connects only to PAIR on `127.0.0.1`, and its window only to that server. `.\dashboard.ps1 selftest -Fixture`
-rechecks the window's guard.
+`%LOCALAPPDATA%\PhotoSort\dashboard`: state, logs without file names, job records and the window's cache. Its
+server connects only to PAIR on `127.0.0.1`, and its window only to that server. Its jobs run the same
+`photosort.py` with the same `local_only.py` guard, so their model requests go to PAIR on `127.0.0.1` only and
+refuse cloud models (the server refuses a cloud model name before starting a job, too).
+`.\dashboard.ps1 selftest -Fixture` rechecks the window's guard.
 
 To recheck PAIR routing at any time, count requests by target. Every target should be a `192.168.x.x` node,
 `cluster` (PAIR's own model list) or blank (a request that was never routed):
@@ -659,7 +717,16 @@ Dashboard (after `.\dashboard.ps1 setup -Fixture -Yes`), with its private Node.j
 ```powershell
 cd dashboard
 $env:PATH = (Get-ChildItem "$env:LOCALAPPDATA\PhotoSort\runtime\node-v*-win-x64" | Select-Object -Last 1).FullName + ";$env:PATH"
-npm run typecheck; npm test; npm run build   # security suite (20 tests, ~2 s), bundle scan for outside URLs
+npm run typecheck; npm test; npm run build   # 44 tests, ~20 s; the build also scans the bundle for outside URLs
 cd ..
 .\dashboard.ps1 start -Fixture -NoOpen; .\dashboard.ps1 selftest -Fixture; .\dashboard.ps1 stop -Fixture
 ```
+
+`npm test` runs the security suite, the job runner against a stand-in CLI (`server\test\fake_cli.py`), and an
+end-to-end suite (`server\test\e2e.test.ts`). The end-to-end suite builds a fresh synthetic library in `%TEMP%`
+(`dashboard\fixtures\make_fixtures.py`), starts `tests\fake_pair.py` (a fake PAIR on a free loopback port; no
+model) and runs the real `photosort.py` through the server. It covers preview, apply, undo preview and undo for
+sort and group; index and the skip on re-index; a safe stop in the middle of a move (every moved file is
+journaled, none lost); and the time from a CLI event to the page (p95 ≤ 500 ms). The tests find Python through
+`PHOTOSORT_PYTHON`, else `photosort.cmd`'s `PY`. `make_fixtures.py --reset` rebuilds the fixture library of
+fixture mode.

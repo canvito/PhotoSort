@@ -29,6 +29,7 @@ let shutdownJob: string | undefined;
 beforeAll(async () => {
   built = await buildApp({
     port: PORT, token: TOKEN, mode: 'fixture', version: 't', configPath, webDist: dist,
+    dataDir: path.join(tmp, 'data'), python: process.execPath, photosortDir: tmp, fixtureRoots: [path.join(tmp, 'library')],
     onShutdown: (job) => { shutdownJob = job; },
   });
 });
