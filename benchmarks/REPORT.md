@@ -1,5 +1,10 @@
 # PhotoSort model benchmark — NVIDIA PAIR cluster (2026-11-09)
 
+> **Later changes.** This report is a snapshot from the first day. Since then this PC (ErsEv2Bb5) no longer
+> runs models: its Ollama engine is off in PAIR. MinDvBb1, ErsDvDk1, ErsDvBb1 and ErsDvBb2 now serve
+> requests. The current node list and the later measurements (videos, search indexing, `group`) are in
+> [`../README.md`](../README.md).
+
 Endpoint: local PAIR Ollama proxy `http://127.0.0.1:11434` (LAN only; remote plaintext is rejected, peers use mTLS).
 Test set: 12 images (7 public stock photos + 5 synthetic screenshots), downscaled to 1024px JPEG. The images are
 not committed; `bench.py` documents how to build your own labelled set.

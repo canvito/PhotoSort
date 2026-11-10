@@ -150,6 +150,13 @@ def _open_video(path, decoder_threads: int = 0):
         raise VideoError(f"cannot decode video: {e}") from e
 
 
+def video_tags(path) -> dict[str, str]:
+    """The video's metadata tags (e.g. creation_time, com.apple.quicktime.creationdate); container tags win over
+    the video stream's. Nothing is decoded."""
+    with _open_video(path) as (container, stream):
+        return {**stream.metadata, **container.metadata}
+
+
 def video_targets(path, count: int | None = VIDEO_FRAMES) -> list[tuple[int, float]]:
     """(timestamp, seconds from start) of the frames to sample, in time order. count=None: face-tagging frames."""
     with _open_video(path) as (container, stream):

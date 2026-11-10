@@ -18,12 +18,13 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
 from PIL import Image, ImageOps
 
+import group
 from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
 from local_only import LocalOnlyError, require_local_models, require_loopback
 from media import VIDEO_EXTS, VideoError, encode_pil, is_video, video_jpegs
@@ -116,38 +117,64 @@ class Classifier:
         require_local_models([self.cfg["model"]], self.models)
         return names
 
-    def classify(self, path: Path) -> tuple[str, float]:
+    def media_images(self, path: Path) -> tuple[list[str], int]:
+        """(base64 JPEGs for the model, number of video frames; 0 for a photo)."""
         if is_video(path):
             images = video_jpegs(path, self.cfg["max_side"])
-            prompt = build_prompt(self.buckets, len(images))
-        else:
-            images, prompt = [encode_image(path, self.cfg["max_side"])], self.prompt
+            return images, len(images)
+        return [encode_image(path, self.cfg["max_side"])], 0
+
+    def chat(self, prompt: str, images: list[str], schema: dict, parse, num_predict: int = 128, label: str = ""):
+        """One JSON-schema chat request to the local PAIR proxy, with retries; returns parse(reply text)."""
+        message = {"role": "user", "content": prompt, **({"images": images} if images else {})}
         body = {
-            "model": self.cfg["model"], "stream": False, "think": False, "format": self.schema,
-            "keep_alive": "30m", "options": {"temperature": 0, "num_predict": 128, "num_ctx": 4096},
-            "messages": [{"role": "user", "content": prompt, "images": images}],
+            "model": self.cfg["model"], "stream": False, "think": False, "format": schema,
+            "keep_alive": "30m", "options": {"temperature": 0, "num_predict": num_predict, "num_ctx": 4096},
+            "messages": [message],
         }
         err = "no attempts"
         for attempt in range(self.cfg["retries"]):
             try:
                 r = self._session().post(f"{self.url}/api/chat", json=body, timeout=self.cfg["timeout_s"])
                 r.raise_for_status()
-                return parse_reply(r.json()["message"]["content"], self.buckets)
+                return parse(r.json()["message"]["content"])
             except (requests.RequestException, ValueError, KeyError, TypeError) as e:
                 err = f"{type(e).__name__}: {str(e)[:200]}"
-                log.debug("retry %d for %s: %s", attempt + 1, path.name, err)
+                log.debug("retry %d for %s: %s", attempt + 1, label, err)
                 time.sleep(min(2 ** attempt, 10))
         raise ClassifyError(err)
 
+    def classify(self, path: Path) -> tuple[str, float]:
+        images, frames = self.media_images(path)
+        prompt = build_prompt(self.buckets, frames) if frames else self.prompt
+        return self.chat(prompt, images, self.schema, lambda c: parse_reply(c, self.buckets), label=path.name)
+
+    def matches(self, path: Path, topic: str) -> tuple[bool, float]:
+        """Does this photo or video show `topic`? (group) Asked in each of group.MATCH_WORDINGS until one says yes;
+        the file is decoded and encoded once."""
+        images, frames = self.media_images(path)
+        for wording in group.MATCH_WORDINGS:
+            found, confidence = self.chat(group.match_prompt(topic, frames, wording), images, group.MATCH_SCHEMA,
+                                          group.parse_match, label=path.name)
+            if found:
+                break
+        return found, confidence
+
+    def read_request(self, request: str, today: date) -> dict:
+        """The user's group request (text only, no photo) as topic, media and dates."""
+        return self.chat(group.request_prompt(request, today), [], group.REQUEST_SCHEMA,
+                         lambda c: group.parse_request_reply(c, today), num_predict=256, label="request")
+
 
 def scan(source: Path, dest: Path, buckets, recursive: bool) -> tuple[list[Path], int]:
-    """Return (photos and videos to sort, count of other files). Files already in bucket folders are ignored."""
-    bucket_dirs = {(dest / b).resolve() for b in buckets}
+    """Return (photos and videos to sort, count of other files). Files already in bucket folders, and everything
+    in group folders, are ignored."""
+    skip_dirs = {(dest / b).resolve() for b in buckets} | (group.group_dirs(source) if recursive else set())
     images, skipped = [], 0
     for p in sorted(source.rglob("*") if recursive else source.iterdir()):
-        if not p.is_file() or p.name == JOURNAL_NAME:
+        if not p.is_file() or p.name in (JOURNAL_NAME, group.GROUP_MARKER):
             continue
-        if bucket_dirs.intersection(p.resolve().parents):
+        if skip_dirs.intersection(p.resolve().parents):
             continue
         if p.suffix.lower() in MEDIA_EXTS:
             images.append(p)
@@ -231,6 +258,137 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
     return summary
 
 
+def understand_request(clf, request: str, today: date, overrides: dict | None = None) -> dict:
+    """Read the request UNDERSTAND_VOTES times in parallel (the PAIR proxy spreads them over the nodes) and
+    return the plan they agree on."""
+    if not request.strip():
+        raise group.GroupError("the request is empty")
+    with ThreadPoolExecutor(max_workers=group.UNDERSTAND_VOTES, thread_name_prefix="request") as ex:
+        futures = [ex.submit(clf.read_request, request, today) for _ in range(group.UNDERSTAND_VOTES)]
+    readings, failures = [], []
+    for fut in futures:
+        try:
+            readings.append(fut.result())
+        except ClassifyError as e:
+            failures.append(str(e))
+    if len(readings) < 2:
+        raise ClassifyError(f"the request could not be read: {'; '.join(failures) or 'no readings'}")
+    return group.plan_request(readings, request, today, overrides)
+
+
+def _capture_times(paths: list[Path], span) -> dict[Path, tuple[datetime | None, str]]:
+    """Capture time of each file, read in parallel (metadata only, nothing is decoded); files whose OneDrive name
+    is days away from the span are not opened."""
+    out, todo = {}, []
+    for p in paths:
+        if group.far_by_name(p.name, span):
+            out[p] = (None, "far by file name")
+        else:
+            todo.append(p)
+    with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 4) * 2), thread_name_prefix="dates") as ex:
+        for p, found in zip(todo, ex.map(lambda q: group.capture_time(q, is_video(q)), todo)):
+            out[p] = found
+    return out
+
+
+def group_folder(cfg: dict, source: Path, request: str, action: str = "move", name: str | None = None,
+                 overrides: dict | None = None, limit: int = 0, classifier=None, today: date | None = None) -> dict:
+    """Move (or copy, or only report) the photos and videos under `source` that match a plain-language request
+    into one group folder in `source`. Everything else stays where it is."""
+    started, t_start = datetime.now(), time.perf_counter()
+    source = Path(source).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"source folder not found: {source}")
+    today = today or date.today()
+    clf = classifier
+    if clf is None:
+        clf = Classifier(cfg)
+        clf.preflight()
+    plan = understand_request(clf, request, today, overrides)
+    title = group.folder_name(plan, name, cfg["buckets"])
+    target = source / title
+    if target.exists() and not (target / group.GROUP_MARKER).exists():
+        target = unique_path(target)  # never pour files into a folder of the user's own
+    already = sum(1 for p in target.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS) \
+        if target.is_dir() else 0
+    files, skipped = scan(source, source, {}, recursive=True)
+    wanted = {"photos": lambda p: not is_video(p), "videos": is_video, "both": lambda p: True}[plan["media"]]
+    files = [p for p in files if wanted(p)]
+    span = group.window(plan)
+    times = _capture_times(files, span) if span else {}
+    in_range, other_dates, no_date = [], 0, 0
+    for p in files:
+        taken, _ = times.get(p, (None, "not needed"))
+        if span is None or (taken and span[0] <= taken < span[1]):
+            in_range.append(p)
+        elif taken or times[p][1] == "far by file name":
+            other_dates += 1
+        else:
+            no_date += 1
+    in_range = in_range[: limit or None]
+    run_id = started.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    journal = source / JOURNAL_NAME
+    log.info("run %s: %d files, %d in range (%s), topic=%r, action=%s, model=%s, workers=%d", run_id, len(files),
+             len(in_range), group.dates_text(plan), plan["topic"], action, cfg["model"], cfg["concurrency"])
+    found, videos, errors, moves = [], 0, 0, []
+    ex = ThreadPoolExecutor(max_workers=cfg["concurrency"], thread_name_prefix="group")
+    with journal.open("a", encoding="utf-8") as jf:
+        if plan["topic"]:
+            futures = {ex.submit(clf.matches, p, plan["topic"]): p for p in in_range}
+        else:  # dates only: every file in range belongs to the group
+            futures = {ex.submit(lambda: (True, None)): p for p in in_range}
+        try:
+            for n, fut in enumerate(as_completed(futures), 1):
+                src = futures[fut]
+                taken, source_of_date = times.get(src, (None, "none"))
+                entry = {"ts": datetime.now().isoformat(timespec="seconds"), "run_id": run_id, "action": action,
+                         "model": cfg["model"], "src": str(src), "dst": None, "group": target.name,
+                         "request": request, "taken": taken.isoformat() if taken else None,
+                         "date_source": source_of_date}
+                try:
+                    is_match, conf = fut.result()
+                    entry.update(match=is_match, confidence=None if conf is None else round(conf, 3))
+                    if is_match:
+                        if action in ("move", "copy"):
+                            dst = unique_path(target / src.name)
+                            if not target.exists():
+                                target.mkdir(parents=True)
+                                group.write_marker(target, request, plan, run_id)
+                            (shutil.move if action == "move" else shutil.copy2)(str(src), str(dst))
+                            entry["dst"] = str(dst)
+                            if action == "move":
+                                moves.append((src, dst))
+                        found.append(src)
+                        videos += is_video(src)
+                    log.info("[%d/%d] %-5s %s  %s", n, len(in_range), "MATCH" if is_match else "no",
+                             "" if conf is None else f"{conf:.2f}", src.name)
+                except Exception as e:  # leave the file where it is and keep going
+                    errors += 1
+                    entry["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+                    log.warning("[%d/%d] FAILED %s: %s", n, len(in_range), src.name, entry["error"])
+                jf.write(json.dumps(entry) + "\n")
+                jf.flush()
+        except KeyboardInterrupt:
+            log.warning("interrupted; finished files are journaled, the rest stay in place")
+            raise
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+            update_index_paths(index_path(cfg), moves)
+    elapsed = time.perf_counter() - t_start
+    summary = {"run_id": run_id, "action": action, "model": cfg["model"], "workers": cfg["concurrency"],
+               "source": str(source), "request": request, "topic": plan["topic"], "media": plan["media"],
+               "dates": group.dates_text(plan), "people_ignored": plan["people"], "group": str(target),
+               "journal": str(journal), "scanned": len(files), "other_files": skipped, "in_range": len(in_range),
+               "other_dates": other_dates, "no_date": no_date, "already_in_group": already,
+               "checked": len(in_range) if plan["topic"] else 0, "matched": len(found), "videos": videos,
+               "errors": errors, "matched_paths": sorted(map(str, found)),
+               "started_at": started.isoformat(timespec="seconds"),
+               "finished_at": datetime.now().isoformat(timespec="seconds"), "elapsed_s": round(elapsed, 1),
+               "per_min": round(len(in_range) / elapsed * 60, 1) if elapsed and plan["topic"] else 0.0}
+    log.debug("summary: %s", json.dumps({k: v for k, v in summary.items() if k != "matched_paths"}))
+    return summary
+
+
 def format_duration(seconds: float) -> str:
     if seconds < 59.95:
         return f"{seconds:.1f}s"
@@ -291,12 +449,45 @@ def format_search_results(r: dict, paths_only: bool = False) -> str:
     return "\n".join(lines)
 
 
+def format_group_report(s: dict) -> str:
+    """Plain-ASCII finish report for a group run (the dict returned by group_folder)."""
+    done = {"move": "moved", "copy": "copied"}.get(s["action"], "found (no files changed)")
+    media = {"photos": "photos only", "videos": "videos only", "both": "photos and videos"}[s["media"]]
+    topic = f'topic "{s["topic"]}"' if s["topic"] else "any content"
+    understood = f"{topic}; {media}; {s['dates']}"
+    rows = [("Run", s["run_id"]), ("Folder", s["source"]), ("Request", s["request"]),
+            ("Understood", understood)]
+    if s["people_ignored"]:
+        rows.append(("Note", f"names are not recognized and were ignored: {', '.join(s['people_ignored'])}"))
+    rows += [
+        ("Group folder", s["group"] + (f"  (already held {s['already_in_group']} files)"
+                                       if s["already_in_group"] else "")),
+        ("Model", f"{s['model']}, {s['workers']} parallel workers"),
+        ("Files", f"{s['scanned']} {media} scanned: {s['in_range']} in range, {s['other_dates']} other dates, "
+                  f"{s['no_date']} with no capture date"),
+        ("Checked", f"{s['checked']} files by the model" if s["topic"] else "not needed (dates only)"),
+        ("Result", f"{s['matched']} files {done} ({s['matched'] - s['videos']} photos, {s['videos']} videos); "
+                   f"{s['errors']} errors; everything else left where it was"),
+        ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "
+                     f"finished {s['finished_at'].replace('T', ' ')})"),
+    ]
+    if s["topic"]:
+        rows.append(("Speed", f"{s['per_min']} files/min checked"))
+    rows.append(("Journal", s["journal"]))
+    lines = ["", "=== PhotoSort group report ==="] + [f"{k:<12}: {v}" for k, v in rows]
+    if s["action"] == "report" and s["matched_paths"]:
+        lines += ["", "Matches"] + [f"  {p}" for p in s["matched_paths"]]
+    return "\n".join(lines)
+
+
 def remove_empty_folder(folder: Path) -> None:
-    """Delete a bucket folder once it is empty. OneDrive can mark synced folders read-only,
-    which makes rmdir fail with 'Access is denied' on Windows, so clear that flag first."""
+    """Delete a bucket or group folder once it is empty (a group folder's marker file does not count). OneDrive
+    can mark synced folders read-only, which makes rmdir fail with 'Access is denied' on Windows, so clear that
+    flag first."""
     try:
-        if any(folder.iterdir()):
+        if any(p.name != group.GROUP_MARKER for p in folder.iterdir()):
             return
+        (folder / group.GROUP_MARKER).unlink(missing_ok=True)
         try:
             folder.rmdir()
         except PermissionError:
@@ -354,9 +545,23 @@ def main(argv=None) -> int:
     s.add_argument("--limit", type=int, default=0, help="only process the first N files")
     s.add_argument("--concurrency", type=int, help="parallel requests to the PAIR cluster")
     s.add_argument("--model", help="override the configured model")
-    u = sub.add_parser("undo", help="move files from a sort run back to their original location")
+    u = sub.add_parser("undo", help="move files from a sort or group run back to their original location")
     u.add_argument("journal", type=Path, help=f"path to {JOURNAL_NAME}")
     u.add_argument("--run-id", help="run to undo (default: latest run not yet undone)")
+    g = sub.add_parser("group", help="gather the photos and videos that match a plain-language request into one "
+                                     "folder; everything else stays where it is")
+    g.add_argument("source", type=Path, help="folder to look in (always including subfolders and bucket folders)")
+    g.add_argument("request", help='e.g. "birthday party last Sunday" or "videos of the beach from last weekend"')
+    g.add_argument("--action", choices=["move", "copy", "report"], help="default from config")
+    g.add_argument("--name", help="group folder name (default: from the request, with its dates)")
+    g.add_argument("--from", dest="date_from", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                   help="first day, instead of the dates in the request")
+    g.add_argument("--to", dest="date_to", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                   help="last day (default with --from: today)")
+    g.add_argument("--media", choices=group.MEDIA, help="instead of what the request says")
+    g.add_argument("--limit", type=int, default=0, help="only check the first N files in range")
+    g.add_argument("--concurrency", type=int, help="parallel requests to the PAIR cluster")
+    g.add_argument("--model", help="override the configured model")
     f = sub.add_parser("faces", help="detect and locally tag faces using named reference-photo folders")
     f.add_argument("source", type=Path, help="folder of photos and videos to analyze; originals are not modified")
     f.add_argument("--people", type=Path, required=True,
@@ -430,6 +635,19 @@ def main(argv=None) -> int:
             cfg["model"] = a.model
         if a.concurrency:
             cfg["concurrency"] = a.concurrency
+        if a.cmd == "group":
+            overrides = {}
+            if a.date_to and not a.date_from:
+                raise group.GroupError("--to needs --from")
+            if a.date_from:
+                overrides.update(date_from=a.date_from, date_to=a.date_to or date.today())
+                if overrides["date_from"] > overrides["date_to"]:
+                    raise group.GroupError("--from is after --to")
+            if a.media:
+                overrides["media"] = a.media
+            summary = group_folder(cfg, a.source, a.request, a.action or cfg["action"], a.name, overrides, a.limit)
+            print(format_group_report(summary), flush=True)
+            return 1 if summary["errors"] else 0
         summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit)
         print(format_report(summary), flush=True)
         return 1 if summary["errors"] else 0

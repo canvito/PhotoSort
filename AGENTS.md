@@ -7,8 +7,8 @@ as any feature, config or procedure change.
 
 - **Standing rule: no cloud model or cloud service ever reads the user's photos, screenshots or videos, or
   anything derived from them** (image bytes, video frames, faces, captions, visible text, embeddings, the
-  search index). This applies to every command (`sort`, `index`, `search`, `faces`) and to you, the agent:
-  do not view/attach personal images, videos or frames; when inspecting them, print numbers only. Bucket sorting, search captioning/embedding and search queries go only to the local PAIR
+  search index). This applies to every command (`sort`, `group`, `index`, `search`, `faces`) and to you, the agent:
+  do not view/attach personal images, videos or frames; when inspecting them, print numbers only. Bucket sorting, group request reading and matching, search captioning/embedding and search queries go only to the local PAIR
   Ollama proxy at `http://127.0.0.1:11434`, using models running on the user's own machines; face detection
   only to `local` or LAN SSH face workers. Never weaken or bypass the code guard (`local_only.py`): it
   refuses non-loopback endpoints and Ollama cloud models (names ending `-cloud`/`:cloud`, or listed by PAIR
@@ -55,6 +55,34 @@ reload the model); faces checks every keyframe plus gap fill to ~1 s. Audio/spee
 Report to the user: files sorted (photos, videos), errors, duration, files/min, per-bucket counts (all in the
 finish report).
 
+## Group photos and videos by a plain-language request
+
+```powershell
+.\photosort.cmd group "<folder>" "<request>" --action report   # preview; prints what it understood and counts
+.\photosort.cmd group "<folder>" "<request>"                   # move matches into one group folder in <folder>
+.\photosort.cmd group "<folder>" "<topic>" --from 2026-11-07 --to 2026-11-08 --media photos --name "<name>"
+```
+
+- Use it when the user asks to sort/group/gather files "by" an event, topic or day and leave everything else
+  where it is (e.g. "sort group photo and video by birthday party on last Sunday"). Pass the user's words as
+  the request, unchanged. Preview with `--action report` first unless the user clearly asked to move them. In
+  report mode the output lists matching paths; show the user counts and the duration, and paths only if they
+  ask.
+- The request (the user's text, no media) is read 3 times in parallel by the local model; dates, kind of files
+  and whether there is a topic must agree, or `group` stops (exit 2) with what to add. Do not retry with your own
+  guess of the dates: pass the user's dates with `--from`/`--to`, or ask the user. Dates come from code-computed
+  named days (`group.named_days`), not model arithmetic. Names of people are not recognized.
+- Capture dates: EXIF / Apple `com.apple.quicktime.creationdate` / file name (OneDrive camera-upload names are
+  UTC) / video `creation_time` last; never the modified time. A topic day runs to 4 am the next day.
+- Matching: two wordings (`group.MATCH_WORDINGS`: strict "shows", then "taken at"), the second only when the
+  first says no; a match if either is yes. Measured on public photos: birthday parties 22/22 found, 2 false
+  matches in 110 look-alikes; one lenient wording gave 10 false matches. Do not change the wordings without
+  re-measuring both found and false matches.
+- `group` looks in all subfolders, including bucket folders, and skips group folders (marker
+  `_photosort_group.json`); `sort --recursive` skips them too. Undo with `undo` on the folder's journal.
+- Report: what was understood, group folder, files scanned / in range / other dates / no capture date, checked,
+  found (photos, videos), errors, duration, files/min (all in the finish report).
+
 ## Search photos and videos in plain language
 
 ```powershell
@@ -95,7 +123,7 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
-## Known facts (2026-11-09)
+## Known facts (as of 2026-11-10)
 
 - Only spark1 accepts SSH. AxiDvBb1, CVPRISM2, MinDvBb1, ErsDvBb1 have port 22 closed; the Mac-mini has
   Remote Login off. Windows workers (e.g. CVPRISM2) are not supported by the code yet.
@@ -107,9 +135,11 @@ automatically when it changes; no manual copy needed.
 - Do not shrink or re-encode photos or video frames before sending them to gain speed: tested, it changes results (lost
   1–2% of faces, flipped some matches). Full-resolution results are exactly repeatable. Faster networking
   is the only speed-up the user accepts (no speed-for-accuracy trades). Video frames go as lossless PNG.
-- PAIR nodes serving models: spark1, AxiDvBb1, ErsDvDk1, MinDvBb1, Mac-mini, and CVPRISM2 (fastest, RTX 3090; it was
-  not answering on 2026-11-09; without it indexing ran ~27 instead of ~75 images/min). Not this PC (Ollama
-  off, see Hard rules).
+- PAIR nodes serving models: CVPRISM2 (fastest, RTX 3090; back online on 2026-11-10, it served most requests that day),
+  spark1, MinDvBb1, AxiDvBb1, ErsDvBb2, the Mac-mini, ErsDvBb1 and ErsDvDk1. Without CVPRISM2 indexing ran ~27
+  instead of ~75 images/min. Not this PC (Ollama off, see Hard rules). To see which node served a request, read
+  the PAIR log `%LOCALAPPDATA%\NVIDIA Corporation\Personal AI Router\logs\nvpair.jsonl` (`data.path`
+  `/api/chat`, `data.node_id`) and map ids to names with `cluster\members.json` (`nodeUuid`, `name`).
 - PAIR cannot run InsightFace (it only routes LLM engines); that is why face workers use SSH.
 - Search indexing with gemma4:12b at 12 in flight: 261 real photos in 3m 30s (74.6 images/min); ~27/min
   when the cluster is busy. 24 in flight was slower (57.1/min) and caused a truncated reply. Captions are

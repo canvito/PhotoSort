@@ -1,14 +1,15 @@
 # PhotoSort
 
-Sorts photos, screenshots and videos into bucket folders (people, food, screenshot_chat, …), finds them by
+Sorts photos, screenshots and videos into bucket folders (people, food, screenshot_chat, …), gathers the ones
+that match a plain-language request ("birthday party last Sunday") into one folder, finds them by
 plain-language search, and tags faces, using **local models only**. Model requests go to the NVIDIA PAIR
 (Personal AI Router) Ollama proxy on this PC (`http://127.0.0.1:11434`), which spreads them across the PAIR
 cluster on the LAN. This PC itself does not run models (its Ollama engine is off in PAIR; see
 [Cluster nodes](#model-choice-benchmark-2026-11-09)).
 
 **Privacy (standing rule):** photos, screenshots, videos and anything derived from them (video frames, faces,
-captions, visible text, embeddings, the search index) never go to a cloud LLM or cloud service. This covers sorting, search
-indexing, search queries and face tagging. It is enforced in code (`local_only.py`): PhotoSort refuses any
+captions, visible text, embeddings, the search index) never go to a cloud LLM or cloud service. This covers sorting, grouping, search
+indexing, search queries and face tagging. A `group` request is your own text, and it too goes only to the local models. It is enforced in code (`local_only.py`): PhotoSort refuses any
 non-loopback `base_url`, ignores system/env HTTP proxies, and refuses Ollama cloud models (names ending
 `-cloud`/`:cloud`, or models that PAIR lists with `remote_host`/`remote_model`), both when the config or
 `--model` names one and at preflight before any photo is sent.
@@ -50,7 +51,11 @@ cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
 # Other options
 .\photosort.cmd sort "<folder>" --action copy --dest "D:\Sorted" --recursive --limit 20 --concurrency 16
 
-# Undo the latest sort run in a folder (moves files back, removes empty bucket folders)
+# Gather the files that match a plain-language request into one folder; everything else stays put
+.\photosort.cmd group "<folder>" "birthday party on last Sunday" --action report
+.\photosort.cmd group "<folder>" "birthday party on last Sunday"
+
+# Undo the latest sort or group run in a folder (moves files back, removes empty bucket or group folders)
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl"
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --run-id 20261109-111724-591f86
 ```
@@ -66,7 +71,8 @@ Behavior:
 - `--recursive` takes the photos and videos from every subfolder and moves them into the one set of buckets
   at the source (or `--dest`) root; subfolders do not get buckets of their own. Only bucket folders at that
   root are skipped, so bucket folders left inside subfolders by earlier per-folder sorts are re-sorted into
-  the root buckets. Other files stay in their subfolders; emptied subfolders are kept.
+  the root buckets. Group folders made by `group` (they hold a `_photosort_group.json` marker) are always
+  skipped. Other files stay in their subfolders; emptied subfolders are kept.
 - Sorting moves/copies files without opening or re-encoding their content; photo and video bytes,
   including EXIF and video metadata, are preserved. A cross-volume move may have normal filesystem-metadata
   differences.
@@ -84,12 +90,13 @@ Behavior:
 
 ## Videos
 
-`sort`, `index`/`search` and `faces` all handle videos. Videos are decoded **on this PC** (PyAV); the models
+`sort`, `group`, `index`/`search` and `faces` all handle videos. Videos are decoded **on this PC** (PyAV); the models
 see still frames, never the video file, and the video file is only read: never modified or re-encoded.
 
 | Command | Frames used | Notes |
 |---|---|---|
 | `sort` | 8 frames spread evenly over the video, in time order, in **one** request | The model picks one bucket for the whole video |
+| `group` | the same 8 frames, in one request | The model says whether the video shows the request's topic |
 | `index` | the same 8 frames, in one request | The caption describes the whole video; search finds it like a photo |
 | `faces` | every keyframe, plus extra frames wherever keyframes are more than ~1 s apart | Full-resolution, lossless frames |
 
@@ -102,6 +109,96 @@ see still frames, never the video file, and the video file is only read: never m
 - Speed (56 real phone videos, 4.9 GB, 2026-11-09): `sort --action report` 2m 17s (24.5 files/min,
   0 errors); the real `sort --recursive` move 1m 08s (49.2 files/min, 0 errors, total size unchanged
   after the move). Face detection on `spark1:16`: 1,511 frames in 85.7 s (**1,058 frames/min**; 2,479 faces).
+
+## Group photos and videos by a plain-language request
+
+`group` gathers the photos and videos that match a request such as "birthday party on last Sunday" into one
+folder and leaves everything else where it is.
+
+```powershell
+# Preview: prints what it understood and the files it would gather; changes nothing
+.\photosort.cmd group "C:\Users\<you>\OneDrive\Pictures\Camera Roll\2026" "sort group photo and video by birthday party on last Sunday. Leave everything else where they are" --action report
+
+# Move them (or --action copy)
+.\photosort.cmd group "<folder>" "birthday party on last Sunday"
+
+# When the request is read wrongly or refused, say the dates, kind of file or folder name yourself
+.\photosort.cmd group "<folder>" "birthday party" --from 2026-11-07 --to 2026-11-08 --media videos --name "Mia turns 5"
+
+# Undo the latest run (moves the files back and removes the emptied group folder)
+.\photosort.cmd undo "<folder>\_photosort_journal.jsonl"
+```
+
+How it works:
+
+1. **Reading the request** (text only; no photo is sent). The local model (`model`) reads the request 3 times
+   in parallel, and the PAIR proxy spreads the readings over the nodes. Each reading gives a topic ("a birthday
+   party"), the kind of files (photos, videos or both) and the dates. The model gets a calendar of the last 9
+   weeks and a table of named days worked out in code, so "last Sunday" is a lookup, not arithmetic. The table
+   covers today, yesterday, this/last week, this/last weekend, last <weekday> (also "on Sunday"), the <weekday>
+   before last, this/last month, and 13 US holidays (the most recent of each). A month or season without a year
+   is the most recent one; 11/8 is month/day.
+   - The 3 readings must agree on the dates, the kind of files and whether there is a topic. If they don't,
+     `group` stops and asks you to reword the request or to give `--from`/`--to` (and `--media`). Stopping is
+     safer than gathering the wrong files.
+   - The kind of files comes from the request's own words when they are plain ("photos", "pictures",
+     "screenshots", "videos", "clips"; both or neither means both). With a negation ("everything except the
+     videos") the model's reading must agree with the words; if not, `group` stops and suggests the `--media`
+     to add.
+   - Future dates are refused, and a range that ends after today ends today. A request with neither a topic nor
+     dates is refused.
+   - Names of people are not recognized (that is what `faces` is for). A request with only names ("photos of
+     mom") is refused; with a topic, the names are ignored and the report says so.
+2. **Dates** come from each file's capture time, read in parallel from metadata (nothing is decoded):
+   - Photos: EXIF DateTimeOriginal, then DateTimeDigitized, then DateTime.
+   - Videos: Apple's `com.apple.quicktime.creationdate` (local time when filmed), then the file name, then
+     `creation_time` (edited or exported clips set it to the export time).
+   - Without metadata, the date in the file name: OneDrive camera-upload names (`20261108_190000000_iOS.jpg`)
+     are UTC and are converted to this PC's time zone; `IMG_`/`VID_`/`PXL_` names are local time;
+     `Screenshot 2026-11-08` gives the day.
+   - The file's modified time is never used (copying and syncing change it). Files whose OneDrive name is more
+     than 2 days outside the dates are not even opened.
+   - With a topic, a day runs until 4 am the next day (a party that goes past midnight).
+3. **Matching.** Each file in the date range goes to the local vision model (`model`, `concurrency` 12 in
+   flight across the PAIR nodes; a video as 8 frames, as in `sort`). The model is first asked whether the file
+   "shows" the topic, strictly: a similar but different occasion, such as a baby shower for "a birthday party",
+   is a no. If it says no, it is asked a second wording: does the file show the topic, or was it clearly taken
+   at one (its guests, food, decorations or activities)? The file matches if either answer is yes. Without a
+   topic ("everything from Saturday"), every file in the date range matches and no model is needed.
+4. **Gathering.** Matches are moved (the default `action`) or copied into one folder inside the source folder,
+   named from the request and its dates, e.g. `Birthday party 2026-11-08` (`--name` sets it). That folder holds
+   a `_photosort_group.json` marker. If a group folder with that name already exists, matches are added to
+   it. A folder of your own with the same name is never used; a ` (1)` folder is made instead.
+
+Behavior:
+- `group` looks in the folder and all its subfolders, including bucket folders from `sort`. It skips group
+  folders, and `sort --recursive` skips them too.
+- Every checked file is journaled in `_photosort_journal.jsonl` in the folder: capture time and where it came
+  from, match and confidence. `undo` moves the files back and removes the emptied group folder. Moves update
+  the search index paths.
+- The finish report shows what was understood (topic, kind of files, dates), the group folder, files scanned,
+  in range, at other dates and with no capture date, files checked, files found (photos, videos), errors, the
+  **duration** and files/min. With `--action report` it also lists the matching files.
+- Exit code: 0 = done, 1 = some files failed (they stay in place), 2 = request not understood or setup error.
+
+Accuracy and speed (2026-11-10, `gemma4:12b` through PAIR; public images and made-up requests only):
+- **Reading requests:** 39 test requests ("birthday party last Sunday", "pictures from Halloween", "the trip
+  to the lake from Oct 20 to Oct 25", "the party last Sunday but not the videos", …), each read 6 times:
+  217/234 single readings right. With 3 readings that must agree: 36 requests right, 0 wrong, 3 refused (all
+  with "not"/"except"; each refusal names the `--media` to add).
+- **Matching** "a birthday party" on 132 public Wikimedia Commons photos: 22 birthday parties and 110
+  look-alikes (dinner parties, wedding receptions and cakes, picnics, Halloween, Christmas and Thanksgiving
+  dinners, baby showers, graduations, business meetings, cupcakes). Found 22/22, with 2 false matches (a
+  display of pink cupcakes, baby-shower balloons). The "shows" wording alone found 20/22; the "taken at"
+  wording alone 18/22; a single lenient wording found 22/22 but with 10 false matches. 8 short videos made from
+  those photos: 8/8 right. 8 other topics (a dog, a receipt, a bridge, source code, food, mountains, a stock
+  chart, a chat) on 12 photos: 8/8 found, 1 false match (a receipt for "food").
+- **Speed:** 255 checks in 89 s (172 files/min; most files need both wordings), spread over 7 nodes. Reading
+  a request takes about 2–9 s. Real preview on Camera Roll 2026: 768 files scanned, 17 from that Sunday,
+  37.6 s in all.
+- **Limits:** a photo taken at an event that shows nothing of it (guests talking, no cake or decorations in
+  view) can be left behind; preview with `--action report`. Times of day ("Sunday afternoon") are not used;
+  the whole day is.
 
 ## Search photos and videos in plain language
 
@@ -304,11 +401,11 @@ pack is intended for personal/non-commercial use; review the model license befor
 | Key | Default | Meaning |
 |---|---|---|
 | `base_url` | `http://127.0.0.1:11434` | PAIR Ollama proxy; must be loopback |
-| `model` | `gemma4:12b` | Vision model (see below) |
+| `model` | `gemma4:12b` | Vision model for `sort` and `group` (see below) |
 | `concurrency` | `12` | Parallel requests (workers) sent to the cluster |
 | `max_side` | `1024` | Images are downscaled in memory before sending; originals untouched |
 | `timeout_s`, `retries` | `300`, `3` | Per-request timeout and retry count |
-| `action` | `move` | Default action: `move`, `copy` or `report` |
+| `action` | `move` | Default action for `sort` and `group`: `move`, `copy` or `report` |
 | `face_workers` | `["spark1:16"]` | Where `faces` runs detection: SSH `HOST[:THREADS]` and/or `local[:THREADS]`; `--workers` overrides |
 | `caption_model` | `gemma4:12b` | Vision model that describes photos for `index` |
 | `embed_model` | `qwen3-embedding:8b` | Embedding model for photo descriptions and search queries |
@@ -380,11 +477,16 @@ so they can't use the whole cluster; switch `model` only if 12b accuracy isn't g
   are left in place. A video that can't be decoded is reported as an error and left in place.
 - This PC's GPU is busy again during a run: its Ollama engine was turned back on in PAIR. Turn it off there.
 - `search` says "no search index": run `index` on a folder first.
+- `group` says "the request was read in different ways": the 3 readings disagreed. Reword it (say the day, e.g.
+  "on Sunday 11/8"), or give `--from`/`--to` and `--media`. "the request could mean … or …": add the `--media`
+  it suggests. "cannot pick out specific people": describe what the photos show instead of who is in them.
+- `group` found fewer files than expected: check the report's "with no capture date" and "other dates" counts
+  (the dates come from metadata, not the modified time), and preview with `--action report`.
 - First requests are slow (up to ~60 s): nodes are loading the model; it stays loaded for 30 min.
 - A run's last few files take longer: slow nodes (e.g. the Mac-mini) finish their last request.
 - PAIR quirks seen: `/api/show` through the proxy can hit a node without models (404) — PhotoSort only
-  uses `/api/tags` and `/api/chat`. ErsDvBb1 has no models. MinDvBb1 and ErsDvDk1 serve requests too
-  (seen 2026-11-09).
+  uses `/api/tags` and `/api/chat`. Nodes that served requests on 2026-11-10 (from the PAIR log): CVPRISM2,
+  spark1, MinDvBb1, AxiDvBb1, ErsDvBb2, the Mac-mini and ErsDvBb1 (ErsDvDk1 served on 2026-11-09).
 - Mac-mini runs different builds of `gemma4:12b`/`qwen3.5:9b`; re-pull them there for consistent results.
 - `faces`: "face worker environment not found" means the host was never set up: run
   `.\photosort.cmd faces-setup HOST`. Check SSH itself with `ssh -o BatchMode=yes HOST hostname`

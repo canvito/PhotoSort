@@ -7,6 +7,7 @@ import stat
 import sys
 import threading
 import zlib
+from datetime import date, datetime
 from fractions import Fraction
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import photosort  # noqa: E402
 import photo_search  # noqa: E402
 import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
+import group  # noqa: E402
 import media  # noqa: E402
 
 BUCKETS = {"people": "", "food": "", "screenshot_chat": "", "other": ""}
@@ -503,10 +505,11 @@ COLORS = {"red": (255, 0, 0), "blue": (0, 0, 255), "green": (0, 128, 0), "yellow
           "white": (255, 255, 255)}
 
 
-def make_video(path, colors, fps=10, gop=10, size=(64, 48)):
+def make_video(path, colors, fps=10, gop=10, size=(64, 48), metadata=None):
     """A small mpeg4 video showing one solid color per second, with a keyframe every `gop` frames."""
     av = pytest.importorskip("av")
-    with av.open(str(path), "w") as out:
+    with av.open(str(path), "w", options={"movflags": "use_metadata_tags"} if metadata else {}) as out:
+        out.metadata.update(metadata or {})
         stream = out.add_stream("mpeg4", rate=fps)
         stream.width, stream.height = size
         stream.pix_fmt = "yuv420p"
@@ -699,3 +702,179 @@ def test_a_crashed_frame_process_fails_only_its_own_video():
         assert pool.frames("e.mov", [2.0]) == [(2.0, b"png")]
     finally:
         pool.shutdown()
+
+
+# ---------- group by plain-language request ----------
+
+TODAY = date(2026, 11, 10)  # a Tuesday; "last Sunday" is 2026-11-08
+APPLE_DATE = "com.apple.quicktime.creationdate"
+
+
+def photo_taken(path, when=None):
+    """A small photo with EXIF DateTimeOriginal `when` ("YYYY:MM:DD HH:MM:SS"), or with no EXIF at all."""
+    exif = Image.Exif()
+    exif[0x8769] = {0x9003: when}
+    Image.new("RGB", (32, 24), "red").save(path, **({"exif": exif.tobytes()} if when else {}))
+    return path
+
+
+def reading(**changes):
+    """One reading of a request as the model would return it (default: birthday party last Sunday)."""
+    reply = {"topic": "a birthday party", "media": "both", "date_from": "2026-11-08", "date_to": "2026-11-08",
+             "people_named": [], "folder_name": "Birthday party", **changes}
+    return json.dumps(reply)
+
+
+def test_capture_time_prefers_metadata_and_reads_onedrive_names_as_utc(tmp_path):
+    photo = photo_taken(tmp_path / "20261109_030000000_iOS.jpg", "2026:11:08 19:00:00")
+    assert group.capture_time(photo, False) == (datetime(2026, 11, 8, 19), "photo metadata")
+    named = photo_taken(tmp_path / "20261108_120000000_iOS.png")
+    assert group.capture_time(named, False) == (group._local(datetime(2026, 11, 8, 12)), "file name")
+    assert group.capture_time(photo_taken(tmp_path / "scan.jpg"), False) == (None, "none")
+
+    make_video(tmp_path / "edited.mov", ["red"], metadata={  # an edited clip: creation_time is the export
+        APPLE_DATE: "2026-11-08T18:00:00-0800", "creation_time": "2026-11-20T00:00:00.000000Z"})
+    assert group.capture_time(tmp_path / "edited.mov", True) == (datetime(2026, 11, 8, 18), "video metadata")
+    make_video(tmp_path / "export.mov", ["red"], metadata={"creation_time": "2026-11-08T20:00:00.000000Z"})
+    assert group.capture_time(tmp_path / "export.mov", True) == (group._local(datetime(2026, 11, 8, 20)),
+                                                                 "video metadata")
+
+    span = group.window(group.parse_request_reply(reading(), TODAY))
+    assert span == (datetime(2026, 11, 8), datetime(2026, 11, 9, 4))  # a party can run past midnight
+    assert group.far_by_name("20261020_120000000_iOS.jpg", span)
+    assert not group.far_by_name("20261109_070000000_iOS.jpg", span) and not group.far_by_name("IMG_1.jpg", span)
+
+
+def test_request_readings_must_agree_and_name_something_to_find():
+    def plan(*replies, overrides=None):
+        return group.agree([group.parse_request_reply(r, TODAY) for r in replies], TODAY, overrides)
+
+    p = plan(reading(), reading(topic="birthday party"), reading())
+    assert (p["topic"], p["media"], group.dates_text(p)) == ("a birthday party", "both", "Sun 2026-11-08")
+    sunday_or_saturday = (reading(), reading(date_from="2026-11-07", date_to="2026-11-07"))
+    with pytest.raises(group.GroupError, match="different ways"):
+        plan(*sunday_or_saturday)
+    fixed = plan(*sunday_or_saturday, overrides={"date_from": date(2026, 11, 7), "date_to": date(2026, 11, 8)})
+    assert group.dates_text(fixed) == "Sat 2026-11-07 to Sun 2026-11-08"
+    with pytest.raises(group.GroupError, match="different ways"):
+        plan(reading(), reading(topic=""))
+    with pytest.raises(group.GroupError, match="future"):
+        plan(reading(date_from="2026-11-15", date_to="2026-11-15"))
+    assert plan(reading(date_from="2026-11-09", date_to="2026-11-15"))["date_to"] == TODAY
+    with pytest.raises(group.GroupError, match="neither"):
+        plan(reading(topic="", date_from="", date_to=""))
+    with pytest.raises(group.GroupError, match="specific people"):
+        plan(reading(topic="", people_named=["mom"]))
+    assert plan(reading(people_named=["mom"]))["people"] == ["mom"]  # the topic is used; the report says so
+
+    assert group.folder_name(p, None, BUCKETS) == "Birthday party 2026-11-08"
+    assert group.folder_name({**p, "folder_name": 'Food: "best" <of>?'}, None, BUCKETS) == "Food best of 2026-11-08"
+    assert group.folder_name(p, "food", BUCKETS) == "food group" and group.folder_name(p, "CON", {}) == "CON group"
+
+
+def test_named_days_are_worked_out_in_code():
+    sunday = {name: (a, b) for name, a, b in group.named_days(date(2026, 11, 8))}
+    assert sunday["this weekend"] == (date(2026, 11, 7), date(2026, 11, 8))
+    assert sunday["last weekend"] == (date(2026, 10, 31), date(2026, 11, 1))
+    assert sunday['last Sunday (also "on Sunday")'] == (date(2026, 11, 1),) * 2
+    days = {name: a for name, a, _ in group.named_days(TODAY)}
+    assert days["Thanksgiving"] == date(2025, 11, 27) and days["Halloween"] == date(2026, 10, 31)
+    assert days["the Sunday before last (two Sundays ago)"] == date(2026, 11, 1) and "this weekend" not in days
+
+
+def test_media_comes_from_the_requests_own_words_and_a_negated_request_must_be_confirmed():
+    def plan(request, *replies, overrides=None):
+        return group.plan_request([group.parse_request_reply(r, TODAY) for r in replies], request, TODAY, overrides)
+
+    assert plan("the snow photos last Sunday", reading(media="both"))["media"] == "photos"
+    assert plan("photo and video of the party", reading(media="photos"))["media"] == "both"
+    assert plan("party last Sunday", reading(media="videos"), overrides={"media": "videos"})["media"] == "videos"
+    assert group.media_from_words("everything except the videos") == ("photos", False)
+    assert plan("everything except the videos", reading(media="photos"))["media"] == "photos"
+    with pytest.raises(group.GroupError, match="--media photos"):
+        plan("everything except the videos", reading(media="both"))
+
+
+def test_request_is_read_three_times_as_text_only_with_a_dated_calendar():
+    chat = FakeChat(reading())
+    clf = photosort.Classifier({**CFG, **LOCAL})
+    clf._session = lambda: chat
+
+    p = photosort.understand_request(clf, "birthday party on last Sunday", TODAY)
+
+    assert group.dates_text(p) == "Sun 2026-11-08" and len(chat.bodies) == group.UNDERSTAND_VOTES
+    message = chat.bodies[0]["messages"][0]
+    assert "images" not in message and chat.bodies[0]["format"] == group.REQUEST_SCHEMA
+    assert "2026-11-08 Sunday\n" in message["content"] and "2026-11-10 Tuesday  <- today" in message["content"]
+    assert "<<<birthday party on last Sunday>>>" in message["content"]
+
+
+def test_a_file_is_asked_the_second_wording_only_when_the_first_says_no(tmp_path):
+    photo = photo_taken(tmp_path / "a.jpg")
+    clf = photosort.Classifier({**CFG, **LOCAL})
+    no, yes = '{"match": false, "confidence": 0.9}', '{"match": true, "confidence": 0.8}'
+    for replies, want, asked in (((yes,), (True, 0.8), 1), ((no, yes), (True, 0.8), 2), ((no, no), (False, 0.9), 2)):
+        chat = FakeChat(*replies)
+        clf._session = lambda: chat
+        assert clf.matches(photo, "a birthday party") == want and len(chat.bodies) == asked
+    first, second = (b["messages"][0] for b in chat.bodies)
+    assert "shows that itself" in first["content"] and "clearly taken at one" in second["content"]
+    assert first["images"] == second["images"] and '"a birthday party"' in second["content"]
+
+
+class FakeGrouper:
+    """Reads every request as `reply`; a file shows the topic when 'party' is in its name."""
+
+    def __init__(self, reply):
+        self.reply, self.checked = reply, []
+
+    def read_request(self, request, today):
+        return group.parse_request_reply(self.reply, today)
+
+    def matches(self, path, topic):
+        self.checked.append(path.name)
+        if path.stem == "broken":
+            raise photosort.ClassifyError("model unavailable")
+        return "party" in path.stem, 0.9
+
+
+def test_group_moves_only_matching_files_from_that_day_and_undo_restores_them(tmp_path):
+    (tmp_path / "food").mkdir()
+    (tmp_path / "Old group").mkdir()
+    (tmp_path / "Old group" / group.GROUP_MARKER).write_text("{}")
+    sunday = {"party_afternoon.jpg": "2026:11:08 15:00:00", "party_after_midnight.jpg": "2026:11:09 01:30:00",
+              "cake.jpg": "2026:11:08 16:00:00", "food/party_snacks.jpg": "2026:11:08 17:00:00",
+              "broken.jpg": "2026:11:08 12:00:00", "Old group/party_before.jpg": "2026:11:08 14:00:00"}
+    other = {"party_next_morning.jpg": "2026:11:09 09:00:00", "party_october.jpg": "2026:10:01 12:00:00",
+             "20261020_120000000_iOS_party.jpg": None, "party_undated.jpg": None}
+    for name, when in {**sunday, **other}.items():
+        photo_taken(tmp_path / name, when)
+    make_video(tmp_path / "party_clip.mov", ["red"], metadata={APPLE_DATE: "2026-11-08T18:00:00-0800"})
+    (tmp_path / "notes.txt").write_text("x")
+    fake = FakeGrouper(reading())
+
+    s = photosort.group_folder(CFG, tmp_path, "birthday party on last Sunday", "move", classifier=fake, today=TODAY)
+
+    target = tmp_path / "Birthday party 2026-11-08"
+    moved = {"party_afternoon.jpg", "party_after_midnight.jpg", "party_snacks.jpg", "party_clip.mov"}
+    assert {p.name for p in target.iterdir()} == moved | {group.GROUP_MARKER}
+    assert (s["scanned"], s["in_range"], s["other_dates"], s["no_date"]) == (10, 6, 3, 1)
+    assert (s["checked"], s["matched"], s["videos"], s["errors"], s["other_files"]) == (6, 4, 1, 1, 1)
+    assert "20261020_120000000_iOS_party.jpg" not in fake.checked  # days away by name: not even opened
+    for name in ["cake.jpg", "broken.jpg", "Old group/party_before.jpg", "notes.txt", *other]:
+        assert (tmp_path / name).exists()
+    rest = photosort.scan(tmp_path, tmp_path, BUCKETS, recursive=True)[0]  # what sort --recursive would take
+    assert rest and not any(target in p.parents or tmp_path / "Old group" in p.parents for p in rest)
+    report = photosort.format_group_report(s)
+    assert 'topic "a birthday party"; photos and videos; Sun 2026-11-08' in report and "Duration" in report
+
+    assert photosort.undo(tmp_path / photosort.JOURNAL_NAME)["restored"] == 4
+    assert not target.exists() and (tmp_path / "food" / "party_snacks.jpg").exists()
+
+    fake.checked.clear()
+    dates_only = FakeGrouper(reading(topic="", media="photos", folder_name="Sunday"))
+    r = photosort.group_folder(CFG, tmp_path, "photos from last Sunday", "report", classifier=dates_only,
+                               today=TODAY)
+    assert {Path(p).name for p in r["matched_paths"]} == {"party_afternoon.jpg", "cake.jpg", "party_snacks.jpg",
+                                                          "broken.jpg"}  # the day only; photos only
+    assert not dates_only.checked and r["checked"] == 0 and not (tmp_path / "Sunday 2026-11-08").exists()
