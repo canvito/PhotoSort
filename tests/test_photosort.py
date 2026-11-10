@@ -823,10 +823,11 @@ def test_a_file_is_asked_the_second_wording_only_when_the_first_says_no(tmp_path
 
 
 class FakeGrouper:
-    """Reads every request as `reply`; a file shows the topic when 'party' is in its name."""
+    """Reads every request as `reply`; a file shows the topic when 'party' is in its name, and is from the same
+    occasion when 'guests' or 'friends' is."""
 
     def __init__(self, reply):
-        self.reply, self.checked = reply, []
+        self.reply, self.checked, self.same_event_checked = reply, [], []
 
     def read_request(self, request, today):
         return group.parse_request_reply(self.reply, today)
@@ -836,6 +837,10 @@ class FakeGrouper:
         if path.stem == "broken":
             raise photosort.ClassifyError("model unavailable")
         return "party" in path.stem, 0.9
+
+    def same_event(self, path, topic):
+        self.same_event_checked.append(path.name)
+        return "guests" in path.stem or "friends" in path.stem, 0.7
 
 
 def test_group_moves_only_matching_files_from_that_day_and_undo_restores_them(tmp_path):
@@ -878,3 +883,35 @@ def test_group_moves_only_matching_files_from_that_day_and_undo_restores_them(tm
     assert {Path(p).name for p in r["matched_paths"]} == {"party_afternoon.jpg", "cake.jpg", "party_snacks.jpg",
                                                           "broken.jpg"}  # the day only; photos only
     assert not dates_only.checked and r["checked"] == 0 and not (tmp_path / "Sunday 2026-11-08").exists()
+
+
+def test_files_taken_near_a_match_or_the_existing_group_are_asked_if_from_the_same_occasion(tmp_path):
+    held = tmp_path / "Birthday party 2026-11-08"  # from an earlier run of the same request
+    held.mkdir()
+    (held / group.GROUP_MARKER).write_text("{}")
+    photo_taken(held / "party_earlier_run.jpg", "2026:11:08 16:00:00")
+    for name, when in {"party_cake.jpg": "2026:11:08 11:16:00", "guests.jpg": "2026:11:08 11:20:00",
+                       "screenshot.jpg": "2026:11:08 11:24:00", "more_guests.jpg": "2026:11:08 11:29:00",
+                       "guests_later.jpg": "2026:11:08 14:30:00", "friends.jpg": "2026:11:08 16:05:00"}.items():
+        photo_taken(tmp_path / name, when)
+    fake = FakeGrouper(reading())
+
+    s = photosort.group_folder(CFG, tmp_path, "birthday party on last Sunday", "move", classifier=fake, today=TODAY)
+
+    # more_guests is 9 minutes from guests but 13 from the match: a same-occasion answer does not reach further
+    assert sorted(fake.same_event_checked) == ["friends.jpg", "guests.jpg", "screenshot.jpg"]
+    assert {p.name for p in held.iterdir()} == {"party_earlier_run.jpg", "party_cake.jpg", "guests.jpg",
+                                                "friends.jpg", group.GROUP_MARKER}
+    assert (s["already_in_group"], s["checked"], s["same_event_checked"], s["same_event_found"], s["matched"]) == \
+        (1, 6, 3, 2, 3)
+    entries = {Path(e["src"]).name: e for e in map(json.loads, (tmp_path / photosort.JOURNAL_NAME).open())}
+    assert (entries["party_cake.jpg"]["matched_by"], entries["guests.jpg"]["matched_by"]) == ("topic", "same event")
+    assert entries["screenshot.jpg"]["near_match"] and entries["screenshot.jpg"]["matched_by"] is None
+    assert "3 more taken near a match" in photosort.format_group_report(s)
+
+    photo_taken(tmp_path / "party_dated.jpg", "2026:11:08 14:25:00")  # a request with no dates still reads
+    photo_taken(tmp_path / "party_undated.jpg")  # capture times; undated files are not asked
+    photo_taken(tmp_path / "guests_undated.jpg")
+    any_day = FakeGrouper(reading(date_from="", date_to=""))
+    r = photosort.group_folder(CFG, tmp_path, "birthday parties", "report", classifier=any_day, today=TODAY)
+    assert any_day.same_event_checked == ["guests_later.jpg"] and r["same_event_found"] == 1

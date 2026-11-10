@@ -78,10 +78,18 @@ finish report).
   first says no; a match if either is yes. Measured on public photos: birthday parties 22/22 found, 2 false
   matches in 110 look-alikes; one lenient wording gave 10 false matches. Do not change the wordings without
   re-measuring both found and false matches.
+- Same occasion: after all files are checked, a non-matching file taken within `group.EVENT_NEAR` (10 min) of a
+  match or of a file already in the group folder is asked `group.same_event_prompt` (no chaining; undated files
+  are not asked). Nothing moves until both passes finish. That prompt says yes to most other events too (75/110),
+  so it must stay limited to files near a match. Measured: 22/22 parties yes, 8/8 unrelated photos no, thing
+  topics 7/7 targets yes and 77/77 others no. Journal entries carry `matched_by` and `near_match`.
 - `group` looks in all subfolders, including bucket folders, and skips group folders (marker
   `_photosort_group.json`); `sort --recursive` skips them too. Undo with `undo` on the folder's journal.
-- Report: what was understood, group folder, files scanned / in range / other dates / no capture date, checked,
-  found (photos, videos), errors, duration, files/min (all in the finish report).
+- Report: what was understood, group folder, files scanned / in range / other dates / no capture date, checked
+  (and asked about the same occasion), found (photos, videos), errors, duration, files/min (all in the finish
+  report).
+- OneDrive can make a `_photosort_journal-<PC>.jsonl` conflict copy while a run writes; merge its lines into the
+  journal in time order and delete it.
 
 ## Search photos and videos in plain language
 

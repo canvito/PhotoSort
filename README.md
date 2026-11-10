@@ -165,20 +165,30 @@ How it works:
    is a no. If it says no, it is asked a second wording: does the file show the topic, or was it clearly taken
    at one (its guests, food, decorations or activities)? The file matches if either answer is yes. Without a
    topic ("everything from Saturday"), every file in the date range matches and no model is needed.
-4. **Gathering.** Matches are moved (the default `action`) or copied into one folder inside the source folder,
-   named from the request and its dates, e.g. `Birthday party 2026-11-08` (`--name` sets it). That folder holds
-   a `_photosort_group.json` marker. If a group folder with that name already exists, matches are added to
-   it. A folder of your own with the same name is never used; a ` (1)` folder is made instead.
+4. **Same occasion.** A file that did not match but was taken within 10 minutes (`EVENT_NEAR` in `group.py`) of
+   a match, or of a file already in the group folder, is asked once more, and told so: was it taken at that same
+   occasion (its people, place, food, decorations or activities)? For a thing rather than an event ("a dog"),
+   it must still show the topic. Files that match this way don't widen the window (no chaining), and files with
+   no capture time are not asked. This pass also runs for a request with no dates (capture times are read for
+   it).
+5. **Gathering.** Nothing moves until every check is done. Then matches are moved (the default `action`) or
+   copied into one folder inside the source folder, named from the request and its dates, e.g.
+   `Birthday party 2026-11-08` (`--name` sets it). That folder holds a `_photosort_group.json` marker. If a group
+   folder with that name already exists, matches are added to it, so running the same request again adds files
+   taken near the ones already gathered. A folder of your own with the same name is never used; a ` (1)` folder
+   is made instead.
 
 Behavior:
 - `group` looks in the folder and all its subfolders, including bucket folders from `sort`. It skips group
   folders, and `sort --recursive` skips them too.
 - Every checked file is journaled in `_photosort_journal.jsonl` in the folder: capture time and where it came
-  from, match and confidence. `undo` moves the files back and removes the emptied group folder. Moves update
-  the search index paths.
+  from, match and confidence, `matched_by` (`topic`, `same event` or `dates`) and `near_match` (asked the
+  same-occasion question). `undo` moves the files back and removes the emptied group folder. Moves update the
+  search index paths. Ctrl+C during the checks moves nothing.
 - The finish report shows what was understood (topic, kind of files, dates), the group folder, files scanned,
-  in range, at other dates and with no capture date, files checked, files found (photos, videos), errors, the
-  **duration** and files/min. With `--action report` it also lists the matching files.
+  in range, at other dates and with no capture date, files checked (and how many taken near a match were asked
+  about the same occasion, and how many were), files found (photos, videos), errors, the **duration** and
+  files/min. With `--action report` it also lists the matching files.
 - Exit code: 0 = done, 1 = some files failed (they stay in place), 2 = request not understood or setup error.
 
 Accuracy and speed (2026-11-10, `gemma4:12b` through PAIR; public images and made-up requests only):
@@ -193,12 +203,16 @@ Accuracy and speed (2026-11-10, `gemma4:12b` through PAIR; public images and mad
   wording alone 18/22; a single lenient wording found 22/22 but with 10 false matches. 8 short videos made from
   those photos: 8/8 right. 8 other topics (a dog, a receipt, a bridge, source code, food, mountains, a stock
   chart, a chat) on 12 photos: 8/8 found, 1 false match (a receipt for "food").
+- **Same-occasion question** (each photo asked as if taken within 10 minutes of a match): the 22 birthday
+  parties 22/22 yes; 8 unrelated photos (4 screenshots, a receipt, a mountain, a bridge, a street) 8/8 no; for
+  7 thing topics, 7/7 targets yes and 77/77 other photos no. Other events (Halloween, weddings, dinners…) get
+  yes 75/110 times, which is why only files taken within 10 minutes of a match are asked. 247 checks in 50 s.
 - **Speed:** 255 checks in 89 s (172 files/min; most files need both wordings), spread over 7 nodes. Reading
   a request takes about 2–9 s. Real preview on Camera Roll 2026: 768 files scanned, 17 from that Sunday,
   37.6 s in all.
-- **Limits:** a photo taken at an event that shows nothing of it (guests talking, no cake or decorations in
-  view) can be left behind; preview with `--action report`. Times of day ("Sunday afternoon") are not used;
-  the whole day is.
+- **Limits:** a photo taken at an event that shows nothing of it and was taken more than 10 minutes from any
+  match can be left behind; preview with `--action report`. Answers on borderline files can differ between runs
+  (different nodes answer them). Times of day ("Sunday afternoon") are not used; the whole day is.
 
 ## Search photos and videos in plain language
 
@@ -482,6 +496,9 @@ so they can't use the whole cluster; switch `model` only if 12b accuracy isn't g
   it suggests. "cannot pick out specific people": describe what the photos show instead of who is in them.
 - `group` found fewer files than expected: check the report's "with no capture date" and "other dates" counts
   (the dates come from metadata, not the modified time), and preview with `--action report`.
+- A `_photosort_journal-<PC name>.jsonl` file appears next to the journal: OneDrive made a conflict copy while
+  a run was writing. Append its lines to `_photosort_journal.jsonl` (in time order) and delete it, so `undo`
+  sees every run.
 - First requests are slow (up to ~60 s): nodes are loading the model; it stays loaded for 30 min.
 - A run's last few files take longer: slow nodes (e.g. the Mac-mini) finish their last request.
 - PAIR quirks seen: `/api/show` through the proxy can hit a node without models (404) — PhotoSort only

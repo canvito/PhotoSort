@@ -160,6 +160,12 @@ class Classifier:
                 break
         return found, confidence
 
+    def same_event(self, path: Path, topic: str) -> tuple[bool, float]:
+        """Was this file, taken near files that show `topic`, taken at that same occasion? (group)"""
+        images, frames = self.media_images(path)
+        return self.chat(group.same_event_prompt(topic, frames), images, group.MATCH_SCHEMA, group.parse_match,
+                         label=path.name)
+
     def read_request(self, request: str, today: date) -> dict:
         """The user's group request (text only, no photo) as topic, media and dates."""
         return self.chat(group.request_prompt(request, today), [], group.REQUEST_SCHEMA,
@@ -276,12 +282,12 @@ def understand_request(clf, request: str, today: date, overrides: dict | None = 
     return group.plan_request(readings, request, today, overrides)
 
 
-def _capture_times(paths: list[Path], span) -> dict[Path, tuple[datetime | None, str]]:
+def _capture_times(paths: list[Path], span=None) -> dict[Path, tuple[datetime | None, str]]:
     """Capture time of each file, read in parallel (metadata only, nothing is decoded); files whose OneDrive name
     is days away from the span are not opened."""
     out, todo = {}, []
     for p in paths:
-        if group.far_by_name(p.name, span):
+        if span and group.far_by_name(p.name, span):
             out[p] = (None, "far by file name")
         else:
             todo.append(p)
@@ -291,10 +297,37 @@ def _capture_times(paths: list[Path], span) -> dict[Path, tuple[datetime | None,
     return out
 
 
+def _check_files(ask, paths: list[Path], topic: str, workers: int, label: str) -> dict[Path, tuple]:
+    """Ask the model about each file in parallel: {path: (match, confidence, error)}. Nothing is moved here."""
+    out = {}
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="group")
+    futures = {ex.submit(ask, p, topic): p for p in paths}
+    try:
+        for n, fut in enumerate(as_completed(futures), 1):
+            src = futures[fut]
+            try:
+                is_match, conf = fut.result()
+                out[src] = (is_match, conf, None)
+                log.info("[%s %d/%d] %-5s %s  %s", label, n, len(paths), "MATCH" if is_match else "no",
+                         "" if conf is None else f"{conf:.2f}", src.name)
+            except Exception as e:  # leave the file where it is and keep going
+                out[src] = (False, None, f"{type(e).__name__}: {str(e)[:200]}")
+                log.warning("[%s %d/%d] FAILED %s: %s", label, n, len(paths), src.name, out[src][2])
+    except KeyboardInterrupt:
+        log.warning("interrupted while checking; no files were moved")
+        raise
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
 def group_folder(cfg: dict, source: Path, request: str, action: str = "move", name: str | None = None,
                  overrides: dict | None = None, limit: int = 0, classifier=None, today: date | None = None) -> dict:
     """Move (or copy, or only report) the photos and videos under `source` that match a plain-language request
-    into one group folder in `source`. Everything else stays where it is."""
+    into one group folder in `source`. Everything else stays where it is.
+
+    Every file in range is checked first; then files with no match taken within group.EVENT_NEAR of a match (or of
+    a file already in the group folder) are asked whether they are from that same occasion; then files move."""
     started, t_start = datetime.now(), time.perf_counter()
     source = Path(source).resolve()
     if not source.is_dir():
@@ -309,8 +342,8 @@ def group_folder(cfg: dict, source: Path, request: str, action: str = "move", na
     target = source / title
     if target.exists() and not (target / group.GROUP_MARKER).exists():
         target = unique_path(target)  # never pour files into a folder of the user's own
-    already = sum(1 for p in target.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS) \
-        if target.is_dir() else 0
+    held = [p for p in target.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS] \
+        if target.is_dir() else []
     files, skipped = scan(source, source, {}, recursive=True)
     wanted = {"photos": lambda p: not is_video(p), "videos": is_video, "both": lambda p: True}[plan["media"]]
     files = [p for p in files if wanted(p)]
@@ -330,24 +363,39 @@ def group_folder(cfg: dict, source: Path, request: str, action: str = "move", na
     journal = source / JOURNAL_NAME
     log.info("run %s: %d files, %d in range (%s), topic=%r, action=%s, model=%s, workers=%d", run_id, len(files),
              len(in_range), group.dates_text(plan), plan["topic"], action, cfg["model"], cfg["concurrency"])
-    found, videos, errors, moves = [], 0, 0, []
-    ex = ThreadPoolExecutor(max_workers=cfg["concurrency"], thread_name_prefix="group")
-    with journal.open("a", encoding="utf-8") as jf:
-        if plan["topic"]:
-            futures = {ex.submit(clf.matches, p, plan["topic"]): p for p in in_range}
-        else:  # dates only: every file in range belongs to the group
-            futures = {ex.submit(lambda: (True, None)): p for p in in_range}
-        try:
-            for n, fut in enumerate(as_completed(futures), 1):
-                src = futures[fut]
+    near = []
+    if plan["topic"]:
+        if span is None:  # dates were not needed to pick the files, but the same-occasion check needs them
+            times = _capture_times(in_range)
+        results = {p: r + ("topic",) for p, r in
+                   _check_files(clf.matches, in_range, plan["topic"], cfg["concurrency"], "check").items()}
+        anchors = [times[p][0] for p, r in results.items() if r[0] and times.get(p, (None,))[0]]
+        anchors += [t for t, _ in _capture_times(held).values() if t]
+        near = [p for p in in_range
+                if not results[p][0] and not results[p][2] and group.near_matches(times.get(p, (None,))[0], anchors)]
+        if near:
+            log.info("%d files with no match were taken within %d minutes of a match; asking if they are from the "
+                     "same occasion", len(near), group.EVENT_NEAR.total_seconds() // 60)
+            for p, r in _check_files(clf.same_event, near, plan["topic"], cfg["concurrency"], "same event").items():
+                results[p] = r + ("same event",) if r[2] is None else (False, results[p][1], f"same event: {r[2]}",
+                                                                       "topic")
+    else:  # dates only: every file in range belongs to the group
+        results = {p: (True, None, None, "dates") for p in in_range}
+    found, videos, errors, moves, near_set = [], 0, 0, [], set(near)
+    try:
+        with journal.open("a", encoding="utf-8") as jf:
+            for src in in_range:
+                is_match, conf, error, how = results[src]
                 taken, source_of_date = times.get(src, (None, "none"))
                 entry = {"ts": datetime.now().isoformat(timespec="seconds"), "run_id": run_id, "action": action,
                          "model": cfg["model"], "src": str(src), "dst": None, "group": target.name,
                          "request": request, "taken": taken.isoformat() if taken else None,
-                         "date_source": source_of_date}
+                         "date_source": source_of_date, "match": is_match,
+                         "confidence": None if conf is None else round(conf, 3),
+                         "matched_by": how if is_match else None, "near_match": src in near_set}
                 try:
-                    is_match, conf = fut.result()
-                    entry.update(match=is_match, confidence=None if conf is None else round(conf, 3))
+                    if error:
+                        raise ClassifyError(error)
                     if is_match:
                         if action in ("move", "copy"):
                             dst = unique_path(target / src.name)
@@ -360,28 +408,27 @@ def group_folder(cfg: dict, source: Path, request: str, action: str = "move", na
                                 moves.append((src, dst))
                         found.append(src)
                         videos += is_video(src)
-                    log.info("[%d/%d] %-5s %s  %s", n, len(in_range), "MATCH" if is_match else "no",
-                             "" if conf is None else f"{conf:.2f}", src.name)
                 except Exception as e:  # leave the file where it is and keep going
                     errors += 1
-                    entry["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-                    log.warning("[%d/%d] FAILED %s: %s", n, len(in_range), src.name, entry["error"])
+                    entry["error"] = error or f"{type(e).__name__}: {str(e)[:200]}"
+                    if not error:
+                        log.warning("could not %s %s: %s", action, src.name, entry["error"])
                 jf.write(json.dumps(entry) + "\n")
                 jf.flush()
-        except KeyboardInterrupt:
-            log.warning("interrupted; finished files are journaled, the rest stay in place")
-            raise
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
-            update_index_paths(index_path(cfg), moves)
+    except KeyboardInterrupt:
+        log.warning("interrupted; moved files are journaled, the rest stay in place")
+        raise
+    finally:
+        update_index_paths(index_path(cfg), moves)
     elapsed = time.perf_counter() - t_start
     summary = {"run_id": run_id, "action": action, "model": cfg["model"], "workers": cfg["concurrency"],
                "source": str(source), "request": request, "topic": plan["topic"], "media": plan["media"],
                "dates": group.dates_text(plan), "people_ignored": plan["people"], "group": str(target),
                "journal": str(journal), "scanned": len(files), "other_files": skipped, "in_range": len(in_range),
-               "other_dates": other_dates, "no_date": no_date, "already_in_group": already,
-               "checked": len(in_range) if plan["topic"] else 0, "matched": len(found), "videos": videos,
-               "errors": errors, "matched_paths": sorted(map(str, found)),
+               "other_dates": other_dates, "no_date": no_date, "already_in_group": len(held),
+               "checked": len(in_range) if plan["topic"] else 0, "same_event_checked": len(near),
+               "same_event_found": sum(1 for p in found if results[p][3] == "same event"),
+               "matched": len(found), "videos": videos, "errors": errors, "matched_paths": sorted(map(str, found)),
                "started_at": started.isoformat(timespec="seconds"),
                "finished_at": datetime.now().isoformat(timespec="seconds"), "elapsed_s": round(elapsed, 1),
                "per_min": round(len(in_range) / elapsed * 60, 1) if elapsed and plan["topic"] else 0.0}
@@ -465,7 +512,10 @@ def format_group_report(s: dict) -> str:
         ("Model", f"{s['model']}, {s['workers']} parallel workers"),
         ("Files", f"{s['scanned']} {media} scanned: {s['in_range']} in range, {s['other_dates']} other dates, "
                   f"{s['no_date']} with no capture date"),
-        ("Checked", f"{s['checked']} files by the model" if s["topic"] else "not needed (dates only)"),
+        ("Checked", (f"{s['checked']} files by the model" + (
+            f"; {s['same_event_checked']} more taken near a match asked if from the same occasion, "
+            f"{s['same_event_found']} were" if s.get("same_event_checked") else ""))
+            if s["topic"] else "not needed (dates only)"),
         ("Result", f"{s['matched']} files {done} ({s['matched'] - s['videos']} photos, {s['videos']} videos); "
                    f"{s['errors']} errors; everything else left where it was"),
         ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "

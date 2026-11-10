@@ -364,6 +364,29 @@ def match_prompt(topic: str, frames: int = 0, wording: str = "shows") -> str:
     return f"{subject} {ask} Give a confidence from 0 to 1. Reply with JSON only."
 
 
+EVENT_NEAR = timedelta(minutes=10)  # a file this close in time to a match is asked again, as a likely part of it
+
+
+def same_event_prompt(topic: str, frames: int = 0) -> str:
+    """For a file taken near files that matched: is it from that same occasion? Guests, food or the place at a
+    party rarely show the party itself, so they say no to match_prompt."""
+    if frames:
+        subject, it = f"Here are {frames} frames, in time order, from one video in a personal camera roll.", "the video"
+    else:
+        subject, it = "Here is a photo from a personal camera roll.", "the photo"
+    minutes = int(EVENT_NEAR.total_seconds() // 60)
+    return (f'{subject} It was taken within {minutes} minutes of other photos or videos that show "{topic}". '
+            f'If "{topic}" is an event or occasion (such as a party, wedding, game, trip or holiday), answer true '
+            f"if {it} was taken at that same occasion: its people, place, food, decorations or activities. "
+            f'Otherwise (a thing, an animal, a place or a kind of picture), answer true only if {it} shows "{topic}". '
+            f"Answer false if {it} shows something unrelated or you cannot tell. Give a confidence "
+            "from 0 to 1. Reply with JSON only.")
+
+
+def near_matches(taken: datetime | None, anchors: list[datetime]) -> bool:
+    return taken is not None and any(abs(taken - a) <= EVENT_NEAR for a in anchors)
+
+
 def parse_match(content: str) -> tuple[bool, float]:
     data = json.loads(content)
     if not isinstance(data.get("match"), bool):
