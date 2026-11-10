@@ -1,11 +1,15 @@
 # PhotoSort
 
-Sorts photos and screenshots into bucket folders (people, food, screenshot_chat, …) using **local vision
-LLMs only**. Classification requests go to the NVIDIA PAIR (Personal AI Router) Ollama proxy on this PC
-(`http://127.0.0.1:11434`), which spreads them across the PAIR cluster on the LAN.
+Sorts photos and screenshots into bucket folders (people, food, screenshot_chat, …) and finds photos by
+plain-language search, using **local LLMs only**. Model requests go to the NVIDIA PAIR (Personal AI Router)
+Ollama proxy on this PC (`http://127.0.0.1:11434`), which spreads them across the PAIR cluster on the LAN.
 
-**Privacy:** images never go to a cloud LLM. `photosort.py` refuses any non-loopback `base_url`
-and ignores system/env HTTP proxies.
+**Privacy (standing rule):** photos, screenshots and anything derived from them (faces, captions, visible
+text, embeddings, the search index) never go to a cloud LLM or cloud service. This covers sorting, search
+indexing, search queries and face tagging. It is enforced in code (`local_only.py`): PhotoSort refuses any
+non-loopback `base_url`, ignores system/env HTTP proxies, and refuses Ollama cloud models (names ending
+`-cloud`/`:cloud`, or models that PAIR lists with `remote_host`/`remote_model`), both when the config or
+`--model` names one and at preflight before any photo is sent.
 
 ## Setup (once)
 
@@ -68,6 +72,59 @@ Behavior:
   left in place, the **duration** (whole run: start, preflight, scan, classify, move; with start/finish
   times), speed in images/min, the journal path and a per-bucket count. `-v` also logs the raw JSON summary.
 - Exit code: 0 = all sorted, 1 = some files failed, 2 = setup/config error.
+
+## Search photos in plain language
+
+`index` has a local vision model (`gemma4:12b`) describe every photo: a short caption, objects, scene,
+visible text and a people count. A local embedding model (`qwen3-embedding:8b`) turns that description
+into vectors. `search` embeds your query the same way and ranks photos by similarity. Both talk only to
+the local PAIR proxy, and photos are only read, never modified.
+
+```powershell
+# Build or refresh the index (always includes subfolders; re-runs only process new or changed photos)
+.\photosort.cmd index "C:\Users\<you>\OneDrive\Pictures\Camera Roll\2026"
+
+# Search everything indexed, or only one folder
+.\photosort.cmd search "receipt from the hardware store"
+.\photosort.cmd search "kids playing at the beach" --folder "C:\Users\<you>\OneDrive\Pictures" --top 20
+.\photosort.cmd search "stock price chart" --paths-only   # file paths only, no captions
+```
+
+**Index location:** by default, the SQLite database is
+`%LOCALAPPDATA%\PhotoSort\search_index.sqlite` (for example,
+`C:\Users\<you>\AppData\Local\PhotoSort\search_index.sqlite`). It is generated locally on each PC;
+it is not in the PhotoSort repository or OneDrive, and is not shared with another PC. The database
+contains captions and visible text derived from your photos. `index_path` in `config.json` can change
+its location; keep it on a local, non-synced drive. Deleting the database is safe—run `index` again
+to rebuild it. Your photos are not affected.
+
+Behavior:
+- **Speed:** indexing is the slow part (one caption per photo), so it runs in parallel across the PAIR
+  nodes, with `index_concurrency` (12) requests in flight. A real 261-photo folder took 3m 30s (74.6
+  images/min, 0 errors); a busy cluster without CVPRISM2 gave ~27 images/min. 12 measured fastest: 24 in
+  flight on the same folder was slower (57.1 images/min) and produced a truncated reply, because requests
+  queue on the slow nodes. Captions are about 150 tokens, versus a few for a bucket name, so indexing is
+  slower than `sort`. Search is one embedding call (about 0.05 s) plus local math over the index (0.1 s
+  for 261 photos), so it needs no cluster parallelism.
+- **Accuracy:** on the 12 labelled public benchmark images with paraphrased queries ("my kitty", "how much
+  did I pay at the store", "programming code in an editor"), the right photo ranked first 12/12. On the
+  real folder, querying 5 words of a photo's visible text put that photo in the top 5 90% of the time.
+- Each photo gets two vectors: one for what it shows and one for its raw visible text. A photo scores by
+  whichever matches better, so a screenshot is found by its content or by the words in it. (Labelling the
+  text "Visible text: …" made photos with a little text match queries like "text message conversation",
+  and one merged vector let long screenshot text drown out the description; both measured worse.)
+- Re-running `index` skips unchanged photos. Moved, renamed or duplicated photos are recognized by SHA-256
+  and reuse their entry without a model call. Entries for files no longer under the folder are removed.
+  `sort` and `undo` update the index for the files they move, so results keep pointing at the right place.
+- The index is a SQLite file at `%LOCALAPPDATA%\PhotoSort\search_index.sqlite` (`index_path`), outside
+  the repo and OneDrive. It is local to this PC and contains descriptions of private photos. Delete it
+  to start over; no photo files are deleted or changed.
+- The index finish report shows images found, captioned, reused, unchanged, removed, errors, **duration**
+  and images/min. It never prints captions. Exit code 1 if some photos failed; re-run `index` to retry them.
+- Search prints score, path and a short caption per result. `[missing on disk]` marks files moved outside
+  PhotoSort; re-run `index` on the folder. `--paths-only` prints only paths (for scripts and agents).
+- Changing `caption_model` or `embed_model` re-describes photos on the next `index` run; `search` warns
+  about entries made with a different embedding model.
 
 ## Local face tagging
 
@@ -196,6 +253,10 @@ pack is intended for personal/non-commercial use; review the model license befor
 | `timeout_s`, `retries` | `300`, `3` | Per-request timeout and retry count |
 | `action` | `move` | Default action: `move`, `copy` or `report` |
 | `face_workers` | `["spark1:16"]` | Where `faces` runs detection: SSH `HOST[:THREADS]` and/or `local[:THREADS]`; `--workers` overrides |
+| `caption_model` | `gemma4:12b` | Vision model that describes photos for `index` |
+| `embed_model` | `qwen3-embedding:8b` | Embedding model for photo descriptions and search queries |
+| `index_concurrency` | `12` | Parallel caption requests for `index` (measured fastest); `--concurrency` overrides |
+| `index_path` | `%LOCALAPPDATA%\PhotoSort\search_index.sqlite` | Search index file; keep it out of OneDrive |
 | `buckets` | 13 buckets | `name: description`. Descriptions are sent to the model, so make them specific. `other` is required. |
 
 To add/rename a bucket, edit `buckets` in `config.json` and add a one-line description.
@@ -248,6 +309,8 @@ so they can't use the whole cluster; switch `model` only if 12b accuracy isn't g
 ## Troubleshooting
 
 - `check` fails: make sure PAIR is running on this PC and `gemma4:12b` is installed on at least one node.
+  `check` also reports whether the search models (`caption_model`, `embed_model`) are available.
+- `search` says "no search index": run `index` on a folder first.
 - First requests are slow (up to ~60 s): nodes are loading the model; it stays loaded for 30 min.
 - A run's last few images take longer: slow nodes (this laptop, Mac-mini) finish their last request.
 - PAIR quirks seen: `/api/show` through the proxy can hit a node without models (404) — PhotoSort only

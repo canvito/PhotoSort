@@ -1,21 +1,31 @@
 import io
 import json
 import os
+import re
 import socket
 import stat
 import sys
 import threading
+import zlib
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import photosort  # noqa: E402
+import photo_search  # noqa: E402
 import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
 
 BUCKETS = {"people": "", "food": "", "screenshot_chat": "", "other": ""}
 CFG = {"model": "fake", "concurrency": 4, "buckets": BUCKETS}
+
+
+@pytest.fixture(autouse=True)
+def private_search_index(tmp_path_factory, monkeypatch):
+    """Point the default search index at a temp folder so tests never touch the real one."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path_factory.mktemp("appdata")))
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"])
@@ -27,6 +37,39 @@ def test_loopback_endpoints_allowed(url):
 def test_non_loopback_endpoints_refused(url):
     with pytest.raises(photosort.LocalOnlyError):
         photosort.require_loopback(url)
+
+
+@pytest.mark.parametrize("name", ["gpt-oss:120b-cloud", "glm-4.6:cloud", "minimax-m2-cloud"])
+def test_cloud_models_refused_for_sort_index_and_search(name):
+    cfg = {"base_url": "http://127.0.0.1:11434", "model": name, "caption_model": name,
+           "max_side": 1024, "timeout_s": 1, "retries": 1, "buckets": BUCKETS}
+    with pytest.raises(photosort.LocalOnlyError):
+        photosort.Classifier(cfg)
+    with pytest.raises(photosort.LocalOnlyError):
+        photo_search.PairSearchClient(cfg, photosort.encode_image)
+
+
+def test_preflight_refuses_model_the_cluster_reports_as_remote():
+    tags = {"models": [{"name": "gemma4:12b"},
+                       {"name": "qwen3-embedding:8b", "remote_host": "https://ollama.com:443"}]}
+
+    class Tags:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return tags
+
+    class Session:
+        def get(self, url, timeout):
+            return Tags()
+
+    cfg = {"base_url": "http://127.0.0.1:11434", "max_side": 1024, "timeout_s": 1, "retries": 1}
+    client = photo_search.PairSearchClient(cfg, photosort.encode_image)
+    client._session = Session
+    with pytest.raises(photosort.LocalOnlyError):
+        client.preflight([client.s["embed_model"]])
+    client.preflight([client.s["caption_model"]])
 
 
 def test_parse_reply():
@@ -341,3 +384,112 @@ def test_worker_pool_retries_on_another_worker_and_preserves_order(tmp_path):
     assert summary["local"]["images"] == 6 and summary["spark1"]["failed"] == "connection lost"
     with pytest.raises(face_tagger.NoWorkersLeft):
         face_tagger.WorkerPool([FakeConnection("spark1", dies=True)]).detect(paths[0])
+
+
+FAKE_CAPTIONS = {
+    "cat": {"caption": "A fluffy cat sleeping on a sofa.", "scene": "indoor living room",
+            "objects": ["cat", "sofa"], "text": "", "people_count": 0},
+    "beach": {"caption": "Kids playing in the sand at the beach.", "scene": "outdoor beach",
+              "objects": ["sand", "ocean"], "text": "", "people_count": 2},
+    "receipt": {"caption": "A paper document lying on a table.", "scene": "indoor table",
+                "objects": ["paper"], "text": "SAFEWAY TOTAL 42.17", "people_count": 0},
+    "lunch": {"caption": "A plate of noodles.", "scene": "indoor restaurant",
+              "objects": ["noodles", "plate"], "text": "", "people_count": 0},
+}
+
+
+class FakeSearchClient:
+    """Captions from a lookup table and bag-of-words vectors, so ranking is predictable."""
+
+    def __init__(self):
+        self.captioned = []
+
+    def caption(self, path):
+        self.captioned.append(path.name)
+        return FAKE_CAPTIONS[path.stem]
+
+    def embed(self, texts, query=False):
+        v = np.zeros((len(texts), 256), dtype=np.float32)
+        for row, text in zip(v, texts):
+            for word in re.findall(r"[a-z]+", text.lower()):
+                row[zlib.crc32(word.encode()) % 256] += 1
+        return photo_search.unit_rows(v)
+
+
+def make_photos(folder, names):
+    for name in names:
+        (folder / name).write_bytes(f"pixels of {name}".encode())
+
+
+def top_hit(query, client):
+    return photo_search.search_index(CFG, query, client, top=1)["results"][0]
+
+
+def test_index_and_search_match_caption_or_visible_text(tmp_path):
+    make_photos(tmp_path, ["cat.jpg", "beach.jpg", "receipt.png"])
+    (tmp_path / "notes.txt").write_text("not a photo")
+    client = FakeSearchClient()
+
+    s = photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+
+    assert (s["images"], s["captioned"], s["reused"], s["unchanged"], s["errors"]) == (3, 3, 0, 0, 0)
+    assert Path(top_hit("sleeping cat", client)["path"]).name == "cat.jpg"
+    assert Path(top_hit("kids at the beach", client)["path"]).name == "beach.jpg"
+    assert Path(top_hit("safeway receipt", client)["path"]).name == "receipt.png"  # via the text vector
+
+    again = photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+    assert (again["captioned"], again["unchanged"]) == (0, 3) and len(client.captioned) == 3
+
+
+def test_index_reuses_moved_photo_by_content_and_drops_old_path(tmp_path):
+    make_photos(tmp_path, ["cat.jpg", "beach.jpg"])
+    client = FakeSearchClient()
+    photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+    (tmp_path / "2026").mkdir()
+    (tmp_path / "cat.jpg").rename(tmp_path / "2026" / "kitty.jpg")
+
+    s = photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+
+    assert (s["captioned"], s["reused"], s["unchanged"], s["removed"]) == (0, 1, 1, 1)
+    assert len(client.captioned) == 2  # no model call for the moved photo
+    r = photo_search.search_index(CFG, "cat", client)
+    assert r["searched"] == 2 and r["results"][0]["path"] == str(tmp_path.resolve() / "2026" / "kitty.jpg")
+
+
+def test_sort_and_undo_keep_search_index_paths_current(tmp_path):
+    make_photos(tmp_path, ["lunch.jpg"])
+    client = FakeSearchClient()
+    photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+
+    photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier())
+    hit = top_hit("noodles", client)
+    assert hit["path"] == str(tmp_path.resolve() / "food" / "lunch.jpg") and hit["exists"]
+
+    photosort.undo(tmp_path / photosort.JOURNAL_NAME, index_db=photo_search.index_path(CFG))
+    hit = top_hit("noodles", client)
+    assert hit["path"] == str(tmp_path.resolve() / "lunch.jpg") and hit["exists"]
+    assert photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)["unchanged"] == 1
+
+
+def test_photo_edited_before_sort_is_described_again(tmp_path):
+    make_photos(tmp_path, ["lunch.jpg"])
+    client = FakeSearchClient()
+    photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+    (tmp_path / "lunch.jpg").write_bytes(b"cropped in the Photos app")
+
+    photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier())
+    s = photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+
+    assert (s["captioned"], s["unchanged"]) == (1, 0) and client.captioned == ["lunch.jpg", "lunch.jpg"]
+
+
+def test_case_only_rename_leaves_one_index_entry(tmp_path):
+    make_photos(tmp_path, ["cat.jpg"])
+    client = FakeSearchClient()
+    photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+    (tmp_path / "cat.jpg").rename(tmp_path / "CAT.jpg")
+
+    s = photo_search.index_folder(CFG, tmp_path, client, photosort.IMAGE_EXTS)
+
+    assert (s["reused"], s["removed"], s["total_indexed"]) == (1, 1, 1)
+    assert [Path(x["path"]).name for x in photo_search.search_index(CFG, "cat", client)["results"]] == ["CAT.jpg"]

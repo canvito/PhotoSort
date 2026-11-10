@@ -5,12 +5,22 @@ as any feature, config or procedure change.
 
 ## Hard rules (privacy)
 
-- Never send the user's photos, screenshots, faces or image bytes to a cloud LLM or cloud service (that
-  includes you, the agent: do not view/attach personal images). Bucket sorting goes only to the local PAIR
-  Ollama proxy at `http://127.0.0.1:11434`; face detection only to `local` or LAN SSH face workers.
+- **Standing rule: no cloud model or cloud service ever reads the user's photos or screenshots, or anything
+  derived from them** (image bytes, faces, captions, visible text, embeddings, the search index). This
+  applies to every command (`sort`, `index`, `search`, `faces`) and to you, the agent: do not view/attach
+  personal images. Bucket sorting, search captioning/embedding and search queries go only to the local PAIR
+  Ollama proxy at `http://127.0.0.1:11434`, using models running on the user's own machines; face detection
+  only to `local` or LAN SSH face workers. Never weaken or bypass the code guard (`local_only.py`): it
+  refuses non-loopback endpoints and Ollama cloud models (names ending `-cloud`/`:cloud`, or listed by PAIR
+  with `remote_host`/`remote_model`). If a task seems to need a cloud model, stop and ask the user.
 - Training/fine-tuning may use Google Colab only with data the user explicitly provides for that; inference
   stays local. Never commit personal photos (`benchmarks/images/` and results are git-ignored).
 - `sort` moves files by default. Preview with `--action report` or `--limit` when unsure; `undo` reverts.
+- The search index holds descriptions of private photos. Run `search` only with `--paths-only`, and never
+  read the index file (`%LOCALAPPDATA%\PhotoSort\search_index.sqlite`) or print captions. The user can run
+  `search` without `--paths-only` to see captions. The index is a local, per-PC file outside the repo at
+  `%LOCALAPPDATA%\PhotoSort\search_index.sqlite`; keep it out of OneDrive and git. It can be rebuilt by
+  running `index` again.
 
 ## Environment
 
@@ -35,6 +45,20 @@ pulled into the root buckets too, and videos stay in their subfolders. Sort move
 image bytes or re-encoding them.
 
 Report to the user: images sorted, errors, duration, images/min, per-bucket counts (all in the finish report).
+
+## Search photos in plain language
+
+```powershell
+.\photosort.cmd index "<folder>"                          # caption + embed, always recursive; finish report with duration
+.\photosort.cmd search "<query>" --paths-only             # optional: --folder "<folder>" --top 20
+```
+
+- `index` is the slow, parallel part: 12 caption requests in flight across the PAIR nodes (`index_concurrency`,
+  measured fastest; do not raise it for speed). Re-runs only process new or changed photos, so after
+  `sort` or new photos, just run `index` again on the same folder. `sort` and `undo` keep index paths current.
+- Search is a single local embedding call (~0.05 s); it needs no cluster parallelism.
+- Report from the index finish report: images found, captioned, reused, unchanged, removed, errors,
+  duration, images/min. For a search, give the user the paths (or the command to run themselves).
 
 ## Tag faces (InsightFace buffalo_l, reference-photo matching, no training)
 
@@ -63,3 +87,7 @@ automatically when it changes; no manual copy needed.
   1–2% of faces, flipped some matches). Full-resolution results are exactly repeatable. Faster networking
   is the only speed-up the user accepts (no speed-for-accuracy trades).
 - PAIR cannot run InsightFace (it only routes LLM engines); that is why face workers use SSH.
+- Search indexing with gemma4:12b at 12 in flight: 261 real photos in 3m 30s (74.6 images/min); ~27/min
+  when the cluster is busy. 24 in flight was slower (57.1/min) and caused a truncated reply. Captions are
+  ~150 tokens, so indexing is slower than sorting. `qwen3-vl:8b` returned empty/invalid JSON for captions;
+  do not use it. `qwen3-embedding:8b` runs on spark1.

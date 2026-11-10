@@ -7,6 +7,10 @@
   "retries": 3,
   "action": "move",
   "face_workers": ["spark1:16"],
+  "caption_model": "gemma4:12b",
+  "embed_model": "qwen3-embedding:8b",
+  "index_concurrency": 12,
+  "index_path": "%LOCALAPPDATA%\\PhotoSort\\search_index.sqlite",
   "buckets": {
     "people": "Photos whose main subject is one or more people: selfies, portraits, group shots, family, kids.",
     "home": "Photos of a home: rooms, interiors, furniture, appliances, house exterior, yard, home projects or repairs.",

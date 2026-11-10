@@ -1,14 +1,13 @@
 """PhotoSort: sort photos and screenshots into bucket folders with local vision LLMs.
 
 Inference goes only to the NVIDIA PAIR Ollama proxy on this machine (loopback), which
-load-balances requests across the LAN cluster. Images are never sent to cloud services.
+load-balances requests across the LAN cluster. Images are never sent to cloud services or cloud models.
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import io
-import ipaddress
 import itertools
 import json
 import logging
@@ -23,12 +22,14 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from PIL import Image, ImageOps
 
 from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
+from local_only import LocalOnlyError, require_local_models, require_loopback
+from photo_search import (PairSearchClient, SearchError, index_folder, index_path, search_index, settings,
+                          update_index_paths)
 
 try:
     import pillow_heif
@@ -46,30 +47,15 @@ JOURNAL_NAME = "_photosort_journal.jsonl"
 log = logging.getLogger("photosort")
 
 
-class LocalOnlyError(RuntimeError):
-    pass
-
-
 class ClassifyError(RuntimeError):
     pass
-
-
-def require_loopback(url: str) -> None:
-    """Refuse any endpoint that is not on this machine, so images cannot leave via a misconfiguration."""
-    host = urlparse(url).hostname or ""
-    if host == "localhost":
-        return
-    try:
-        if ipaddress.ip_address(host).is_loopback:
-            return
-    except ValueError:
-        pass
-    raise LocalOnlyError(f"Refusing non-loopback endpoint {url!r}; PhotoSort only talks to the local PAIR proxy.")
 
 
 def load_config(path: Path) -> dict:
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     require_loopback(cfg["base_url"])
+    s = settings(cfg)
+    require_local_models([cfg["model"], s["caption_model"], s["embed_model"]])
     if "other" not in cfg["buckets"]:
         raise ValueError("config buckets must include 'other'")
     return cfg
@@ -111,6 +97,7 @@ class Classifier:
 
     def __init__(self, cfg: dict):
         require_loopback(cfg["base_url"])
+        require_local_models([cfg["model"]])
         self.cfg = cfg
         self.url = cfg["base_url"].rstrip("/")
         self.buckets = cfg["buckets"]
@@ -131,9 +118,11 @@ class Classifier:
     def preflight(self) -> list[str]:
         r = self._session().get(f"{self.url}/api/tags", timeout=30)
         r.raise_for_status()
-        names = [m["name"] for m in r.json().get("models", [])]
+        self.models = r.json().get("models", [])
+        names = [m["name"] for m in self.models]
         if self.cfg["model"] not in names:
             raise ClassifyError(f"model {self.cfg['model']!r} is not available in the PAIR cluster")
+        require_local_models([self.cfg["model"]], self.models)
         return names
 
     def classify(self, path: Path) -> tuple[str, float]:
@@ -197,7 +186,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
     run_id = started.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     journal = dest / JOURNAL_NAME
     dest.mkdir(parents=True, exist_ok=True)
-    counts, errors = Counter(), 0
+    counts, errors, moves = Counter(), 0, []
     log.info("run %s: %d images, %d non-image files left in place, action=%s, model=%s, workers=%d",
              run_id, len(images), skipped, action, cfg["model"], cfg["concurrency"])
     ex = ThreadPoolExecutor(max_workers=cfg["concurrency"], thread_name_prefix="photosort")
@@ -216,6 +205,8 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
                         target.parent.mkdir(parents=True, exist_ok=True)
                         (shutil.move if action == "move" else shutil.copy2)(str(src), str(target))
                         entry["dst"] = str(target)
+                        if action == "move":
+                            moves.append((src, target))
                     counts[bucket] += 1
                     log.info("[%d/%d] %-26s %.2f  %s", n, len(images), bucket, conf, src.name)
                 except Exception as e:  # leave the file where it is and keep going
@@ -229,6 +220,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
             raise
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
+            update_index_paths(index_path(cfg), moves)
     elapsed = time.perf_counter() - t_start
     n_sorted = sum(counts.values())
     summary = {"run_id": run_id, "action": action, "model": cfg["model"], "workers": cfg["concurrency"],
@@ -273,6 +265,36 @@ def format_report(s: dict) -> str:
     return "\n".join(lines)
 
 
+def format_index_report(s: dict) -> str:
+    """Plain-ASCII finish report for an index run. Captions are never printed here."""
+    rows = [
+        ("Source", s["source"]),
+        ("Models", f"{s['caption_model']} captions + {s['embed_model']} vectors, {s['workers']} parallel workers"),
+        ("Result", f"{s['images']} images found: {s['captioned']} captioned, {s['reused']} reused (moved or "
+                   f"duplicate), {s['unchanged']} unchanged; {s['errors']} errors"),
+        ("Removed", f"{s['removed']} entries for files no longer in this folder"),
+        ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "
+                     f"finished {s['finished_at'].replace('T', ' ')})"),
+        ("Speed", f"{s['per_min']} images/min captioned"),
+        ("Index", f"{s['index_path']} ({s['total_indexed']} photos total)"),
+    ]
+    return "\n".join(["", "=== PhotoSort index report ==="] + [f"{k:<12}: {v}" for k, v in rows])
+
+
+def format_search_results(r: dict, paths_only: bool = False) -> str:
+    if paths_only:
+        return "\n".join(x["path"] for x in r["results"])
+    lines = [f'Search: "{r["query"]}"  ({len(r["results"])} of {r["searched"]} indexed photos, '
+             f'{format_duration(r["elapsed_s"])})']
+    for n, x in enumerate(r["results"], 1):
+        lines.append(f"{n:>3}. {x['score']:.3f}  {x['path']}{'' if x['exists'] else '  [missing on disk]'}")
+        caption = " ".join(x["caption"].split())
+        lines.append(f"     {caption[:157] + '...' if len(caption) > 160 else caption}")
+    if not r["results"]:
+        lines.append("No indexed photos match this folder; run `photosort index <folder>` first.")
+    return "\n".join(lines)
+
+
 def remove_empty_folder(folder: Path) -> None:
     """Delete a bucket folder once it is empty. OneDrive can mark synced folders read-only,
     which makes rmdir fail with 'Access is denied' on Windows, so clear that flag first."""
@@ -288,7 +310,7 @@ def remove_empty_folder(folder: Path) -> None:
         pass
 
 
-def undo(journal: Path, run_id: str | None = None) -> dict:
+def undo(journal: Path, run_id: str | None = None, index_db: Path | None = None) -> dict:
     """Move files from a sort run back to where they came from (default: latest run not yet undone)."""
     journal = Path(journal)
     entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -299,7 +321,7 @@ def undo(journal: Path, run_id: str | None = None) -> dict:
         if not pending:
             raise ValueError("no move runs left to undo in this journal")
         run_id = pending[-1]
-    restored, problems = 0, 0
+    restored, problems, back = 0, 0, []
     for e in reversed([e for e in moves if e["run_id"] == run_id]):
         src, dst = Path(e["src"]), Path(e["dst"])
         if not dst.exists() or src.exists():
@@ -309,7 +331,10 @@ def undo(journal: Path, run_id: str | None = None) -> dict:
         src.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(dst), str(src))
         restored += 1
+        back.append((dst, src))
         remove_empty_folder(dst.parent)
+    if index_db:
+        update_index_paths(index_db, back)
     with journal.open("a", encoding="utf-8") as jf:
         jf.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "run_id": run_id,
                              "action": "undo", "restored": restored, "problems": problems}) + "\n")
@@ -353,12 +378,23 @@ def main(argv=None) -> int:
     fs = sub.add_parser("faces-setup", help="install the face worker environment and model on SSH hosts")
     fs.add_argument("hosts", nargs="+", help="SSH host aliases, e.g. spark1")
     fs.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")
+    i = sub.add_parser("index", help="caption and embed photos (always including subfolders) for search")
+    i.add_argument("source", type=Path, help="folder to index; photos are only read, never modified")
+    i.add_argument("--limit", type=int, default=0, help="only index the first N images")
+    i.add_argument("--concurrency", type=int, help="parallel caption requests to the PAIR cluster")
+    q = sub.add_parser("search", help="find indexed photos by describing them in plain language")
+    q.add_argument("query", help='e.g. "receipt from the hardware store" or "kids at the beach"')
+    q.add_argument("--folder", type=Path, help="only return photos under this folder")
+    q.add_argument("--top", type=int, default=10, help="number of results (default 10)")
+    q.add_argument("--paths-only", action="store_true", help="print only file paths, no captions")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")  # odd characters in a path must not crash a report
         if a.cmd == "undo":
-            undo(a.journal, a.run_id)
+            undo(a.journal, a.run_id, index_path(load_config(a.config)))
             return 0
         if a.cmd == "faces-setup":
             for host in a.hosts:
@@ -369,26 +405,38 @@ def main(argv=None) -> int:
             workers = a.workers or load_config(a.config).get("face_workers") or ["local"]
             result = tag_people(a.source, a.people, a.output, IMAGE_EXTS, a.recursive, a.limit,
                                 a.threshold, a.margin, a.model, a.model_dir, workers=workers)
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(errors="replace")
             print(format_face_report(result), flush=True)
             return 1 if result["summary"]["errors"] else 0
         cfg = load_config(a.config)
         if a.cmd == "check":
-            names = Classifier(cfg).preflight()
+            clf = Classifier(cfg)
+            names = clf.preflight()
+            s = settings(cfg)
+            require_local_models([s["caption_model"], s["embed_model"]], clf.models)
+            missing = [m for m in (s["caption_model"], s["embed_model"]) if m not in names]
             print(f"OK: {cfg['base_url']} reachable, {len(names)} models, '{cfg['model']}' available. "
-                  f"HEIC support: {'yes' if HEIF_EXTS else 'no (pip install pillow-heif)'}")
+                  f"HEIC support: {'yes' if HEIF_EXTS else 'no (pip install pillow-heif)'}. "
+                  f"Search models: {'available' if not missing else 'MISSING ' + ', '.join(missing)}")
             return 0
+        if a.cmd in ("index", "search"):
+            client = PairSearchClient(cfg, encode_image)
+            if a.cmd == "search":
+                client.preflight([settings(cfg)["embed_model"]])
+                print(format_search_results(search_index(cfg, a.query, client, a.folder, a.top), a.paths_only),
+                      flush=True)
+                return 0
+            client.preflight()
+            result = index_folder(cfg, a.source, client, IMAGE_EXTS, a.limit, a.concurrency)
+            print(format_index_report(result), flush=True)
+            return 1 if result["errors"] else 0
         if a.model:
             cfg["model"] = a.model
         if a.concurrency:
             cfg["concurrency"] = a.concurrency
         summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit)
-        if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(errors="replace")  # odd characters in a path must not crash the report
         print(format_report(summary), flush=True)
         return 1 if summary["errors"] else 0
-    except (LocalOnlyError, ClassifyError, FaceTaggingError, FileNotFoundError,
+    except (LocalOnlyError, ClassifyError, FaceTaggingError, SearchError, FileNotFoundError,
             ValueError, requests.RequestException) as e:
         log.error("%s", e)
         return 2
