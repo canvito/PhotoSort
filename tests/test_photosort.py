@@ -78,6 +78,51 @@ def test_report_action_moves_nothing(tmp_path):
     assert (tmp_path / "lunch.jpg").exists() and not (tmp_path / "food").exists()
 
 
+def test_recursive_in_place_sorts_each_folder_and_preserves_photo_bytes(tmp_path):
+    files = {
+        "selfie.jpg": b"root original",
+        "album/lunch.jpg": b"album lunch original",
+        "album/selfie.jpg": b"album selfie original",
+        "album/nested/chat.png": b"nested chat original",
+    }
+    for relative, content in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    for relative in ("people/already-sorted.jpg", "album/People/old.jpg",
+                     "album/nested/food/old.jpg"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"pre-existing bucket content")
+
+    s = photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier(),
+                              recursive_in_place=True)
+
+    assert s["sorted"] == 4 and s["errors"] == 0
+    expected = {
+        "people/selfie.jpg": files["selfie.jpg"],
+        "album/food/lunch.jpg": files["album/lunch.jpg"],
+        "album/people/selfie.jpg": files["album/selfie.jpg"],
+        "album/nested/screenshot_chat/chat.png": files["album/nested/chat.png"],
+    }
+    for relative, content in expected.items():
+        assert (tmp_path / relative).read_bytes() == content
+    assert (tmp_path / "people/already-sorted.jpg").read_bytes() == b"pre-existing bucket content"
+    assert (tmp_path / "album/People/old.jpg").read_bytes() == b"pre-existing bucket content"
+    assert (tmp_path / "album/nested/food/old.jpg").read_bytes() == b"pre-existing bucket content"
+
+    undone = photosort.undo(tmp_path / photosort.JOURNAL_NAME)
+    assert undone == {"run_id": s["run_id"], "restored": 4, "problems": 0}
+    for relative, content in files.items():
+        assert (tmp_path / relative).read_bytes() == content
+
+
+def test_recursive_in_place_rejects_external_destination(tmp_path):
+    with pytest.raises(ValueError, match="cannot be combined with --dest"):
+        photosort.sort_folder(CFG, tmp_path, dest=tmp_path / "sorted", recursive_in_place=True,
+                              classifier=FakeClassifier())
+
+
 @pytest.mark.parametrize("seconds,expected", [(0.4, "0.4s"), (42.34, "42.3s"), (59.97, "1m 00s"),
                                               (65.2, "1m 05s"), (3723, "1h 02m 03s")])
 def test_format_duration(seconds, expected):

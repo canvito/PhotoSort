@@ -28,6 +28,11 @@ as any feature, config or procedure change.
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" # revert the latest run
 ```
 
+For a directory tree, use `sort "<root>" --recursive-in-place`: bucket each directory's own images
+beside it, preserve the tree, and skip existing bucket folders at any depth. Do not combine with `--dest`.
+Plain `--recursive` still puts all results under one shared destination. Sort moves files without changing
+image bytes or re-encoding them.
+
 Report to the user: images sorted, errors, duration, images/min, per-bucket counts (all in the finish report).
 
 ## Tag faces (InsightFace buffalo_l, reference-photo matching, no training)

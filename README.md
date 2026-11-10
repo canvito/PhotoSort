@@ -37,6 +37,10 @@ cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
 # Other options
 .\photosort.cmd sort "<folder>" --action copy --dest "D:\Sorted" --recursive --limit 20 --concurrency 16
 
+# Recursively sort each folder in place; keep each folder's buckets separate
+.\photosort.cmd sort "C:\Users\<you>\OneDrive\Pictures\Camera Roll\2026" --recursive-in-place --action report
+.\photosort.cmd sort "C:\Users\<you>\OneDrive\Pictures\Camera Roll\2026" --recursive-in-place
+
 # Undo the latest sort run in a folder (moves files back, removes empty bucket folders)
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl"
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --run-id 20261109-111724-591f86
@@ -48,6 +52,12 @@ With the env activated (`conda activate utils`), `python photosort.py ...` works
 Behavior:
 - Buckets are created as subfolders of `--dest` (default: the source folder). Re-running is safe: files
   already in bucket folders are skipped.
+- `--recursive` scans subfolders and places all classified images in the buckets under the source (or
+  `--dest`) root. `--recursive-in-place` instead creates buckets beside the images in each original
+  folder, preserving the folder layout; it skips existing bucket folders at any depth and cannot be
+  combined with `--dest`. Its journal is at the chosen source root.
+- Sorting moves/copies files without opening or re-encoding image content; image bytes, including EXIF,
+  are preserved. A cross-volume move may have normal filesystem-metadata differences.
 - Only images are sorted (`.jpg .jpeg .png .webp .bmp .gif .tif .tiff .heic .heif`); videos and other
   files stay where they are.
 - Name collisions get a ` (1)` suffix; nothing is overwritten.
