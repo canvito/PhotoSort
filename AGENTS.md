@@ -25,6 +25,15 @@ as any feature, config or procedure change.
   `search` without `--paths-only` to see captions. The index is a local, per-PC file outside the repo at
   `%LOCALAPPDATA%\PhotoSort\search_index.sqlite`; keep it out of OneDrive and git. It can be rebuilt by
   running `index` again.
+- **File names and per-file results never reach you.** On the user's folders, `sort`, `group`, `index`,
+  `faces` and `undo` log one line per file (name plus bucket, MATCH/no or error) to stderr, and the finish
+  report goes to stdout (counts only). Send stderr to a local log outside OneDrive and the repo, and show only
+  the report. For example:
+  `.\photosort.cmd sort "<folder>" 2> "$env:LOCALAPPDATA\PhotoSort\logs\sort-<yyyyMMdd-HHmm>.log"`
+  (create the folder first). Never tail, view or grep-print that log, journals or face sidecars. Count
+  matching lines instead, e.g. `(Select-String WARNING <log>).Count`. Send `search --paths-only` output to a
+  local file and report the number of results. The 2026-11-10 privacy audit found 16 file names that got to
+  the agent this way; see README "Privacy audit".
 
 ## Environment
 

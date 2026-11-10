@@ -12,7 +12,11 @@ captions, visible text, embeddings, the search index) never go to a cloud LLM or
 indexing, search queries and face tagging. A `group` request is your own text, and it too goes only to the local models. It is enforced in code (`local_only.py`): PhotoSort refuses any
 non-loopback `base_url`, ignores system/env HTTP proxies, and refuses Ollama cloud models (names ending
 `-cloud`/`:cloud`, or models that PAIR lists with `remote_host`/`remote_model`), both when the config or
-`--model` names one and at preflight before any photo is sent.
+`--model` names one and at preflight before any photo is sent. OneDrive is the one cloud service involved, and
+only as storage: the photos already live there, so OneDrive syncs what PhotoSort does inside a synced folder,
+namely the bucket and group folders, the moved files, `_photosort_journal.jsonl` (file paths, bucket and
+confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive.
+See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
 ## Setup (once)
 
@@ -482,6 +486,36 @@ at that time (asleep or off); when it is down, sorting and indexing are slower.
 
 Larger vision models (gemma4:31b, qwen3-vl:32b, qwen3.6:35b, …) exist only on spark1/AxiDvBb1/MinDvBb1,
 so they can't use the whole cluster; switch `model` only if 12b accuracy isn't good enough.
+
+## Privacy audit
+
+**Last audit: 2026-11-10.** It covered all PhotoSort work to date (sort, group, index and search, faces, and
+videos) and found **no photo, video, frame, face or caption sent to a cloud model or service**:
+
+- **Code:** every model request goes to `127.0.0.1:11434` only (`local_only.py`), ignores HTTP proxy settings and
+  refuses cloud models. Face workers must resolve to LAN addresses (spark1 has a 192.168.x.x LAN address). A face worker
+  listens on its own `127.0.0.1` only and never downloads models while tagging.
+- **PAIR routing:** all 7,537 requests in the PAIR log (2026-10-28 to 2026-11-10) went to `192.168.x.x` nodes or
+  to this PC (before its Ollama was turned off), and none to a public address. All of PAIR's live connections were
+  LAN or loopback. The PAIR log holds no images or prompts. `cluster\members.json` still lists 10.x.x.x
+  addresses for CheEv2Bb6 and ErsDvBb2. Those addresses are private, can't be reached past the home router, and
+  were never used: ErsDvBb2 was served at its 192.168.x.x address.
+- **Models:** none of PAIR's 30 models is a cloud model. `gemma4:12b` (8.0 GB) and `qwen3-embedding:8b`
+  (4.7 GB) are full local weights.
+- **Git:** the repo is private, and its history has no user media, file names, index, journal or captions.
+- **Copilot CLI agent** (a cloud model): it never viewed or attached user media. The only images it saw were
+  contact sheets of the public Wikimedia benchmark images, and its subagents never touched user folders. It
+  did see 16 file names out of 31,253 (no image content), in tailed progress lines, error lines and
+  `search --paths-only` output. Agents now keep those lines in a local log (see `AGENTS.md`).
+
+To recheck PAIR routing at any time, count requests by target. Every target should be a `192.168.x.x` node,
+`cluster` (PAIR's own model list) or blank (a request that was never routed):
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\NVIDIA Corporation\Personal AI Router\logs\nvpair*.jsonl" |
+  Where-Object { $_ -match '"message":"ollama-proxy:proxy/request"' } |
+  ForEach-Object { ($_ | ConvertFrom-Json).data.target } | Group-Object | Select-Object Count, Name
+```
 
 ## Troubleshooting
 
