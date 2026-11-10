@@ -1,4 +1,4 @@
-"""PhotoSort: sort photos and screenshots into bucket folders with local vision LLMs.
+"""PhotoSort: sort photos, screenshots and videos into bucket folders with local vision LLMs.
 
 Inference goes only to the NVIDIA PAIR Ollama proxy on this machine (loopback), which
 load-balances requests across the LAN cluster. Images are never sent to cloud services or cloud models.
@@ -6,8 +6,6 @@ load-balances requests across the LAN cluster. Images are never sent to cloud se
 from __future__ import annotations
 
 import argparse
-import base64
-import io
 import itertools
 import json
 import logging
@@ -28,6 +26,7 @@ from PIL import Image, ImageOps
 
 from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
 from local_only import LocalOnlyError, require_local_models, require_loopback
+from media import VIDEO_EXTS, VideoError, encode_pil, is_video, video_jpegs
 from photo_search import (PairSearchClient, SearchError, index_folder, index_path, search_index, settings,
                           update_index_paths)
 
@@ -42,6 +41,7 @@ except ImportError:
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"} | HEIF_EXTS
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 JOURNAL_NAME = "_photosort_journal.jsonl"
 
 log = logging.getLogger("photosort")
@@ -64,23 +64,14 @@ def load_config(path: Path) -> dict:
 def encode_image(path: Path, max_side: int) -> str:
     """Downscale to max_side (EXIF-rotated, RGB JPEG) and return base64; the original file is untouched."""
     with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im)
-        if im.mode in ("RGBA", "LA", "P"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, "white")
-            bg.paste(im, mask=im.getchannel("A"))
-            im = bg
-        else:
-            im = im.convert("RGB")
-        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+        return encode_pil(ImageOps.exif_transpose(im), max_side)
 
 
-def build_prompt(buckets: dict[str, str]) -> str:
+def build_prompt(buckets: dict[str, str], frames: int = 0) -> str:
     lines = "\n".join(f"- {name}: {desc}" for name, desc in buckets.items())
-    return ("Sort this image from a personal camera roll into exactly one bucket. Buckets:\n"
+    subject = (f"Here are {frames} frame{'s' if frames > 1 else ''}, in time order, from one video in a personal "
+               "camera roll. Sort the whole video" if frames else "Sort this image from a personal camera roll")
+    return (f"{subject} into exactly one bucket. Buckets:\n"
             f"{lines}\nPick the single best bucket and a confidence from 0 to 1. Reply with JSON only.")
 
 
@@ -126,11 +117,15 @@ class Classifier:
         return names
 
     def classify(self, path: Path) -> tuple[str, float]:
+        if is_video(path):
+            images = video_jpegs(path, self.cfg["max_side"])
+            prompt = build_prompt(self.buckets, len(images))
+        else:
+            images, prompt = [encode_image(path, self.cfg["max_side"])], self.prompt
         body = {
             "model": self.cfg["model"], "stream": False, "think": False, "format": self.schema,
             "keep_alive": "30m", "options": {"temperature": 0, "num_predict": 128, "num_ctx": 4096},
-            "messages": [{"role": "user", "content": self.prompt,
-                          "images": [encode_image(path, self.cfg["max_side"])]}],
+            "messages": [{"role": "user", "content": prompt, "images": images}],
         }
         err = "no attempts"
         for attempt in range(self.cfg["retries"]):
@@ -146,7 +141,7 @@ class Classifier:
 
 
 def scan(source: Path, dest: Path, buckets, recursive: bool) -> tuple[list[Path], int]:
-    """Return (images to sort, count of skipped non-image files). Files already in bucket folders are ignored."""
+    """Return (photos and videos to sort, count of other files). Files already in bucket folders are ignored."""
     bucket_dirs = {(dest / b).resolve() for b in buckets}
     images, skipped = [], 0
     for p in sorted(source.rglob("*") if recursive else source.iterdir()):
@@ -154,7 +149,7 @@ def scan(source: Path, dest: Path, buckets, recursive: bool) -> tuple[list[Path]
             continue
         if bucket_dirs.intersection(p.resolve().parents):
             continue
-        if p.suffix.lower() in IMAGE_EXTS:
+        if p.suffix.lower() in MEDIA_EXTS:
             images.append(p)
         else:
             skipped += 1
@@ -186,9 +181,9 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
     run_id = started.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     journal = dest / JOURNAL_NAME
     dest.mkdir(parents=True, exist_ok=True)
-    counts, errors, moves = Counter(), 0, []
-    log.info("run %s: %d images, %d non-image files left in place, action=%s, model=%s, workers=%d",
-             run_id, len(images), skipped, action, cfg["model"], cfg["concurrency"])
+    counts, errors, moves, videos = Counter(), 0, [], 0
+    log.info("run %s: %d files (%d videos), %d other files left in place, action=%s, model=%s, workers=%d",
+             run_id, len(images), sum(map(is_video, images)), skipped, action, cfg["model"], cfg["concurrency"])
     ex = ThreadPoolExecutor(max_workers=cfg["concurrency"], thread_name_prefix="photosort")
     with journal.open("a", encoding="utf-8") as jf:
         futures = {ex.submit(clf.classify, p): p for p in images}
@@ -208,6 +203,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
                         if action == "move":
                             moves.append((src, target))
                     counts[bucket] += 1
+                    videos += is_video(src)
                     log.info("[%d/%d] %-26s %.2f  %s", n, len(images), bucket, conf, src.name)
                 except Exception as e:  # leave the file where it is and keep going
                     errors += 1
@@ -225,7 +221,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
     n_sorted = sum(counts.values())
     summary = {"run_id": run_id, "action": action, "model": cfg["model"], "workers": cfg["concurrency"],
                "source": str(source), "dest": str(dest), "journal": str(journal),
-               "sorted": n_sorted, "errors": errors, "skipped_non_images": skipped,
+               "sorted": n_sorted, "videos": videos, "errors": errors, "skipped_non_images": skipped,
                "started_at": started.isoformat(timespec="seconds"),
                "finished_at": datetime.now().isoformat(timespec="seconds"),
                "elapsed_s": round(elapsed, 1),
@@ -251,11 +247,11 @@ def format_report(s: dict) -> str:
         rows.append(("Destination", s["dest"]))
     rows += [
         ("Model", f"{s['model']}, {s['workers']} parallel workers"),
-        ("Result", f"{s['sorted']} images {done}; {s['errors']} errors; "
-                   f"{s['skipped_non_images']} non-image files left in place"),
+        ("Result", f"{s['sorted']} files {done} ({s['sorted'] - s['videos']} photos, {s['videos']} videos); "
+                   f"{s['errors']} errors; {s['skipped_non_images']} other files left in place"),
         ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "
                      f"finished {s['finished_at'].replace('T', ' ')})"),
-        ("Speed", f"{s['per_min']} images/min"),
+        ("Speed", f"{s['per_min']} files/min"),
         ("Journal", s["journal"]),
     ]
     lines = ["", "=== PhotoSort finish report ==="] + [f"{k:<12}: {v}" for k, v in rows]
@@ -270,13 +266,13 @@ def format_index_report(s: dict) -> str:
     rows = [
         ("Source", s["source"]),
         ("Models", f"{s['caption_model']} captions + {s['embed_model']} vectors, {s['workers']} parallel workers"),
-        ("Result", f"{s['images']} images found: {s['captioned']} captioned, {s['reused']} reused (moved or "
-                   f"duplicate), {s['unchanged']} unchanged; {s['errors']} errors"),
+        ("Result", f"{s['images']} files found ({s['videos']} videos): {s['captioned']} captioned, {s['reused']} "
+                   f"reused (moved or duplicate), {s['unchanged']} unchanged; {s['errors']} errors"),
         ("Removed", f"{s['removed']} entries for files no longer in this folder"),
         ("Duration", f"{format_duration(s['elapsed_s'])}  (started {s['started_at'].replace('T', ' ')}, "
                      f"finished {s['finished_at'].replace('T', ' ')})"),
-        ("Speed", f"{s['per_min']} images/min captioned"),
-        ("Index", f"{s['index_path']} ({s['total_indexed']} photos total)"),
+        ("Speed", f"{s['per_min']} files/min captioned"),
+        ("Index", f"{s['index_path']} ({s['total_indexed']} files total)"),
     ]
     return "\n".join(["", "=== PhotoSort index report ==="] + [f"{k:<12}: {v}" for k, v in rows])
 
@@ -284,14 +280,14 @@ def format_index_report(s: dict) -> str:
 def format_search_results(r: dict, paths_only: bool = False) -> str:
     if paths_only:
         return "\n".join(x["path"] for x in r["results"])
-    lines = [f'Search: "{r["query"]}"  ({len(r["results"])} of {r["searched"]} indexed photos, '
+    lines = [f'Search: "{r["query"]}"  ({len(r["results"])} of {r["searched"]} indexed files, '
              f'{format_duration(r["elapsed_s"])})']
     for n, x in enumerate(r["results"], 1):
         lines.append(f"{n:>3}. {x['score']:.3f}  {x['path']}{'' if x['exists'] else '  [missing on disk]'}")
         caption = " ".join(x["caption"].split())
         lines.append(f"     {caption[:157] + '...' if len(caption) > 160 else caption}")
     if not r["results"]:
-        lines.append("No indexed photos match this folder; run `photosort index <folder>` first.")
+        lines.append("No indexed files match this folder; run `photosort index <folder>` first.")
     return "\n".join(lines)
 
 
@@ -348,21 +344,21 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="verify the local PAIR proxy and model are available")
-    s = sub.add_parser("sort", help="classify images in a folder and sort them into bucket folders")
+    s = sub.add_parser("sort", help="classify photos and videos in a folder and sort them into bucket folders")
     s.add_argument("source", type=Path)
     s.add_argument("--dest", type=Path, help="where bucket folders are created (default: source)")
     s.add_argument("--action", choices=["move", "copy", "report"], help="default from config")
     s.add_argument("--recursive", action="store_true",
-                   help="include subfolders; all their images go into the top-level buckets "
+                   help="include subfolders; all their photos and videos go into the top-level buckets "
                         "(bucket folders there are skipped)")
-    s.add_argument("--limit", type=int, default=0, help="only process the first N images")
+    s.add_argument("--limit", type=int, default=0, help="only process the first N files")
     s.add_argument("--concurrency", type=int, help="parallel requests to the PAIR cluster")
     s.add_argument("--model", help="override the configured model")
     u = sub.add_parser("undo", help="move files from a sort run back to their original location")
     u.add_argument("journal", type=Path, help=f"path to {JOURNAL_NAME}")
     u.add_argument("--run-id", help="run to undo (default: latest run not yet undone)")
     f = sub.add_parser("faces", help="detect and locally tag faces using named reference-photo folders")
-    f.add_argument("source", type=Path, help="folder of photos to analyze; originals are not modified")
+    f.add_argument("source", type=Path, help="folder of photos and videos to analyze; originals are not modified")
     f.add_argument("--people", type=Path, required=True,
                    help="folder containing one subfolder per person, with clear reference photos")
     f.add_argument("--output", type=Path, help="JSON sidecar path (default: <source>\\photosort_faces.json)")
@@ -374,17 +370,17 @@ def main(argv=None) -> int:
     f.add_argument("--margin", type=float, default=0.05,
                    help="minimum lead over the second-best person; ambiguous matches remain unknown")
     f.add_argument("--recursive", action="store_true", help="include subfolders")
-    f.add_argument("--limit", type=int, default=0, help="only process the first N images")
+    f.add_argument("--limit", type=int, default=0, help="only process the first N files")
     fs = sub.add_parser("faces-setup", help="install the face worker environment and model on SSH hosts")
     fs.add_argument("hosts", nargs="+", help="SSH host aliases, e.g. spark1")
     fs.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")
-    i = sub.add_parser("index", help="caption and embed photos (always including subfolders) for search")
-    i.add_argument("source", type=Path, help="folder to index; photos are only read, never modified")
-    i.add_argument("--limit", type=int, default=0, help="only index the first N images")
+    i = sub.add_parser("index", help="caption and embed photos and videos (always including subfolders) for search")
+    i.add_argument("source", type=Path, help="folder to index; files are only read, never modified")
+    i.add_argument("--limit", type=int, default=0, help="only index the first N files")
     i.add_argument("--concurrency", type=int, help="parallel caption requests to the PAIR cluster")
-    q = sub.add_parser("search", help="find indexed photos by describing them in plain language")
+    q = sub.add_parser("search", help="find indexed photos and videos by describing them in plain language")
     q.add_argument("query", help='e.g. "receipt from the hardware store" or "kids at the beach"')
-    q.add_argument("--folder", type=Path, help="only return photos under this folder")
+    q.add_argument("--folder", type=Path, help="only return files under this folder")
     q.add_argument("--top", type=int, default=10, help="number of results (default 10)")
     q.add_argument("--paths-only", action="store_true", help="print only file paths, no captions")
     a = ap.parse_args(argv)
@@ -404,7 +400,7 @@ def main(argv=None) -> int:
         if a.cmd == "faces":
             workers = a.workers or load_config(a.config).get("face_workers") or ["local"]
             result = tag_people(a.source, a.people, a.output, IMAGE_EXTS, a.recursive, a.limit,
-                                a.threshold, a.margin, a.model, a.model_dir, workers=workers)
+                                a.threshold, a.margin, a.model, a.model_dir, workers=workers, video_exts=VIDEO_EXTS)
             print(format_face_report(result), flush=True)
             return 1 if result["summary"]["errors"] else 0
         cfg = load_config(a.config)
@@ -416,6 +412,7 @@ def main(argv=None) -> int:
             missing = [m for m in (s["caption_model"], s["embed_model"]) if m not in names]
             print(f"OK: {cfg['base_url']} reachable, {len(names)} models, '{cfg['model']}' available. "
                   f"HEIC support: {'yes' if HEIF_EXTS else 'no (pip install pillow-heif)'}. "
+                  f"Video support: {'yes' if VIDEO_EXTS else 'no (pip install av)'}. "
                   f"Search models: {'available' if not missing else 'MISSING ' + ', '.join(missing)}")
             return 0
         if a.cmd in ("index", "search"):
@@ -426,7 +423,7 @@ def main(argv=None) -> int:
                       flush=True)
                 return 0
             client.preflight()
-            result = index_folder(cfg, a.source, client, IMAGE_EXTS, a.limit, a.concurrency)
+            result = index_folder(cfg, a.source, client, MEDIA_EXTS, a.limit, a.concurrency)
             print(format_index_report(result), flush=True)
             return 1 if result["errors"] else 0
         if a.model:
@@ -436,7 +433,7 @@ def main(argv=None) -> int:
         summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit)
         print(format_report(summary), flush=True)
         return 1 if summary["errors"] else 0
-    except (LocalOnlyError, ClassifyError, FaceTaggingError, SearchError, FileNotFoundError,
+    except (LocalOnlyError, ClassifyError, FaceTaggingError, SearchError, VideoError, FileNotFoundError,
             ValueError, requests.RequestException) as e:
         log.error("%s", e)
         return 2

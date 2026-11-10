@@ -1,8 +1,9 @@
 """Face detection and reference-photo matching for PhotoSort.
 
 Detection and embeddings run in face workers (face_worker.py): on this PC (`local`) and/or on LAN nodes
-over SSH (e.g. `spark1:16`). Photos travel only inside the encrypted SSH stream, are decoded in the
-worker's memory and are never stored there. Matching against the reference people happens here.
+over SSH (e.g. `spark1:16`). Photos and video frames travel only inside the encrypted SSH stream, are decoded
+in the worker's memory and are never stored there. Videos are decoded on this PC; each sampled frame is sent as
+a lossless full-resolution PNG. Matching against the reference people happens here.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import socket
@@ -21,13 +23,15 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from face_worker import PROTOCOL, FaceTaggingError, InsightFaceBackend, decode_embedding, read_frame, write_frame
+from media import VideoError, frame_pngs, video_targets
 
 __all__ = ["FaceTaggingError", "InsightFaceBackend", "WorkerPool", "format_face_report", "parse_workers",
            "setup_remote_worker", "tag_people"]
@@ -38,6 +42,7 @@ SETUP_SCRIPT = HERE / "face_worker_setup.sh"
 REMOTE_PYTHON = "~/.photosort/venv/bin/python"
 REMOTE_WORKER = "~/.photosort/face_worker.py"
 DEFAULT_THREADS = 8
+FACE_FRAMES_PER_JOB = 4
 READY_TIMEOUT_S = 180
 REQUEST_TIMEOUT_S = 300
 SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -432,8 +437,10 @@ class WorkerPool:
             self._images[conn.label] += done
             self._cond.notify_all()
 
-    def detect(self, path: Path) -> list[dict]:
-        data = Path(path).read_bytes()
+    def detect(self, source) -> list[dict]:
+        """Detect faces in an image file or in encoded image bytes (a video frame)."""
+        raw = isinstance(source, (bytes, bytearray, memoryview))
+        data = bytes(source) if raw else Path(source).read_bytes()
         while True:
             conn = self._acquire()
             done = False
@@ -442,7 +449,7 @@ class WorkerPool:
                 done = True
                 return faces
             except WorkerDied as e:
-                log.warning("%s; retrying %s on another worker", e, Path(path).name)
+                log.warning("%s; retrying %s on another worker", e, "a video frame" if raw else Path(source).name)
             finally:
                 self._release(conn, done)
 
@@ -488,33 +495,50 @@ def _unit_vector(values, context: str) -> list[float]:
     return [v / norm for v in vector]
 
 
-def _detect_all(backend, paths: list[Path], label: str = "") -> list[tuple[list | None, Exception | None]]:
-    """Run backend.detect on every path, in parallel when the backend supports it; keeps input order."""
-    def one(path):
+def _file_size(path) -> int:
+    try:
+        return Path(path).stat().st_size
+    except (OSError, TypeError):
+        return 0
+
+
+def _run_all(jobs: list, threads: int, fn, cost=None, label: str = "") -> list[tuple[object, Exception | None]]:
+    """fn(job) for every job on `threads` threads, costliest first; returns (result, error) in input order."""
+    def one(job):
         try:
-            return backend.detect(path), None
+            return fn(job), None
         except NoWorkersLeft:
             raise
         except (OSError, RuntimeError, ValueError, TypeError) as e:
             return None, e
 
-    workers = max(1, int(getattr(backend, "concurrency", 1)))
-    if workers == 1 or len(paths) < 2:
-        return [one(path) for path in paths]
-    results: list = [None] * len(paths)
-    step = max(25, len(paths) // 10)
-    ex = ThreadPoolExecutor(min(workers, len(paths)))
-    futures = {ex.submit(one, path): i for i, path in enumerate(paths)}
+    if threads <= 1 or len(jobs) < 2:
+        return [one(job) for job in jobs]
+    results: list = [None] * len(jobs)
+    step = max(25, len(jobs) // 10)
+    order = sorted(range(len(jobs)), key=lambda i: cost(jobs[i]), reverse=True) if cost else range(len(jobs))
+    ex = ThreadPoolExecutor(min(threads, len(jobs)))
+    futures = {ex.submit(one, jobs[i]): i for i in order}
     try:
         for count, future in enumerate(as_completed(futures), 1):
             results[futures[future]] = future.result()
-            if label and (count % step == 0 or count == len(paths)):
-                log.info("%s: %d/%d images", label, count, len(paths))
+            if label and (count % step == 0 or count == len(jobs)):
+                log.info("%s: %d/%d jobs", label, count, len(jobs))
     except BaseException:
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     ex.shutdown()
     return results
+
+
+def _concurrency(backend) -> int:
+    return max(1, int(getattr(backend, "concurrency", 1)))
+
+
+def _detect_all(backend, paths: list[Path], label: str = "") -> list[tuple[list | None, Exception | None]]:
+    """Run backend.detect on every path, in parallel when the backend supports it; keeps input order.
+    Largest files go first so one big job doesn't run alone at the end."""
+    return _run_all(paths, _concurrency(backend), backend.detect, _file_size, label)
 
 
 def _reference_people(people_dir: Path, image_exts: set[str], backend) -> dict[str, list[float]]:
@@ -560,6 +584,84 @@ def _image_paths(source: Path, image_exts: set[str], recursive: bool, output: Pa
     return result[:limit or None]
 
 
+class _FramePool:
+    """Local processes that decode and PNG-encode video frames with fn(path, picks).
+
+    A process that dies (a file that crashes the decoder, or out of memory) breaks the whole pool and fails every
+    chunk in it. The pool is then replaced and each failed chunk is redone once in a process of its own, so only
+    the chunk that really crashes fails."""
+
+    def __init__(self, workers: int, fn=frame_pngs):
+        self.workers, self.fn = workers, fn
+        self.lock = threading.Lock()
+        self.pool = ProcessPoolExecutor(workers)
+
+    def frames(self, path, picks):
+        pool = self.pool
+        try:
+            return pool.submit(self.fn, path, picks).result()
+        except BrokenProcessPool:
+            with self.lock:
+                if self.pool is pool:
+                    log.warning("a frame decoding process died; restarting the pool")
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    self.pool = ProcessPoolExecutor(self.workers)
+        with ProcessPoolExecutor(1) as alone:
+            return alone.submit(self.fn, path, picks).result()
+
+    def shutdown(self):
+        with self.lock:
+            self.pool.shutdown(cancel_futures=True)
+
+
+def _detect_media(backend, paths: list[Path], video_exts, label: str = "faces") -> list[tuple[object, Exception | None]]:
+    """Faces for each photo, or {"frames", "faces"} (each face with its time_s) for each video; keeps input order.
+
+    A video's sampled frames are split into jobs of FACE_FRAMES_PER_JOB, so a long video is spread over all
+    worker threads. Frames are decoded and PNG-encoded in local worker processes (that work is CPU-bound and
+    threads would contend for the GIL); each frame then goes to a face worker like a photo would."""
+    threads = _concurrency(backend)
+    videos = [p for p in paths if p.suffix.lower() in video_exts]
+    found = {}
+    jobs = [(p, None) for p in paths if p.suffix.lower() not in video_exts]
+    for path, (picks, error) in zip(videos, _run_all(videos, threads, lambda p: video_targets(p, None))):
+        if error is not None:
+            found[path] = (None, error)
+            continue
+        jobs += [(path, picks[i:i + FACE_FRAMES_PER_JOB]) for i in range(0, len(picks), FACE_FRAMES_PER_JOB)]
+    procs = (_FramePool(min(threads, os.cpu_count() or 1))
+             if threads > 1 and any(picks for _, picks in jobs) else None)
+
+    def run(job):
+        path, picks = job
+        if picks is None:
+            return backend.detect(path)
+        pngs = procs.frames(path, picks) if procs else frame_pngs(path, picks)
+        return [(seconds, backend.detect(png)) for seconds, png in pngs]
+
+    try:
+        done = _run_all(jobs, threads, run, lambda job: _file_size(job[0]), label)
+    finally:
+        if procs:
+            procs.shutdown()
+    merged = {}
+    for (path, picks), (value, error) in zip(jobs, done):
+        if picks is None:
+            found[path] = (value, error)
+            continue
+        video = merged.setdefault(path, {"frames": 0, "faces": [], "error": None})
+        if error is not None:
+            video["error"] = video["error"] or error
+            continue
+        for seconds, faces in value:
+            video["frames"] += 1
+            video["faces"] += [{**face, "time_s": round(seconds, 2)} for face in faces]
+    for path, video in merged.items():
+        error = video.pop("error") or (None if video["frames"] else VideoError("no decodable frames"))
+        found[path] = (None, error) if error else (video, None)
+    return [found.get(p, (None, VideoError("no decodable frames"))) for p in paths]
+
+
 def _match(embedding, people: dict[str, list[float]], threshold: float, margin: float, path: str) -> dict:
     vector = _unit_vector(embedding, path)
     scores = []
@@ -577,8 +679,9 @@ def _match(embedding, people: dict[str, list[float]], threshold: float, margin: 
 def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: set[str],
                recursive: bool = False, limit: int = 0, threshold: float = 0.45, margin: float = 0.05,
                model: str = "buffalo_l", model_dir: Path | None = None, backend=None,
-               workers=("local",)) -> dict:
-    """Detect faces and match them to enrolled reference-photo folders; originals are never modified."""
+               workers=("local",), video_exts=frozenset()) -> dict:
+    """Detect faces in photos and sampled video frames and match them to enrolled reference-photo folders;
+    originals are never modified."""
     started_at = datetime.now()
     t0 = time.perf_counter()
     source = Path(source).expanduser().resolve()
@@ -596,28 +699,33 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
     output = Path(output).expanduser().resolve() if output else source / "photosort_faces.json"
     if output == source or output.is_relative_to(people_dir):
         raise ValueError("output must be a file outside the people reference folder")
-    paths = _image_paths(source, image_exts, recursive, output, people_dir, limit)
+    paths = _image_paths(source, set(image_exts) | set(video_exts), recursive, output, people_dir, limit)
     specs = parse_workers(workers)
     owned = backend is None
     if owned:
         backend = WorkerPool.start(specs, model, model_dir)
     try:
         people = _reference_people(people_dir, image_exts, backend)
-        detected = _detect_all(backend, paths, "faces")
+        detected = _detect_media(backend, paths, video_exts)
     finally:
         if owned:
             backend.close()
 
     records, face_count, matched_count, unknown_count, errors = [], 0, 0, 0, 0
-    for path, (faces, error) in zip(paths, detected):
+    frame_count = 0
+    for path, (found, error) in zip(paths, detected):
         record = {"file": str(path.relative_to(source))}
+        video = path.suffix.lower() in video_exts
+        if video:
+            record["type"] = "video"
         try:
             if error is not None:
                 raise error
             tagged = []
-            for face in faces:
+            for face in found["faces"] if video else found:
                 match = _match(face["embedding"], people, threshold, margin, str(path))
-                tagged.append({"person": match["person"], "similarity": match["similarity"], "bbox": face["bbox"]})
+                tagged.append({**({"time_s": face["time_s"]} if video else {}), "person": match["person"],
+                               "similarity": match["similarity"], "bbox": face["bbox"]})
         except (OSError, RuntimeError, ValueError, TypeError) as e:
             errors += 1
             records.append({**record, "error": f"{type(e).__name__}: {str(e)[:200]}"})
@@ -625,7 +733,13 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
         face_count += len(tagged)
         matched_count += sum(face["person"] is not None for face in tagged)
         unknown_count += sum(face["person"] is None for face in tagged)
+        if video:
+            frame_count += found["frames"]
+            # people: number of sampled frames in which each person was recognized
+            seen = Counter(name for _, name in {(f["time_s"], f["person"]) for f in tagged if f["person"]})
+            record.update(frames=found["frames"], people=dict(seen.most_common()))
         records.append({**record, "faces": tagged})
+    videos = sum(path.suffix.lower() in video_exts for path in paths)
 
     finished_at = datetime.now()
     elapsed = time.perf_counter() - t0
@@ -641,8 +755,8 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
         "finished_at": finished_at.isoformat(timespec="seconds"),
         "duration_s": round(elapsed, 1),
         "summary": {
-            "images": len(paths), "faces": face_count, "matched": matched_count,
-            "unknown": unknown_count, "errors": errors,
+            "images": len(paths) - videos, "videos": videos, "video_frames": frame_count,
+            "faces": face_count, "matched": matched_count, "unknown": unknown_count, "errors": errors,
         },
         "images": records,
     }
@@ -665,22 +779,24 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
 def format_face_report(result: dict) -> str:
     summary = result["summary"]
     duration = result["duration_s"]
-    speed = summary["images"] / duration * 60 if duration > 0 else 0.0
+    frames = summary.get("video_frames", 0)
+    speed = (summary["images"] + frames) / duration * 60 if duration > 0 else 0.0
     lines = [
         "",
         "=== PhotoSort face-tagging report ===",
         f"Model       : {result['model']} ({result.get('provider', 'local')})",
         f"People      : {', '.join(result['people'])}",
-        f"Result      : {summary['images']} images; {summary['faces']} faces; "
-        f"{summary['matched']} matched; {summary['unknown']} unknown; {summary['errors']} errors",
+        f"Result      : {summary['images']} images, {summary.get('videos', 0)} videos ({frames} frames); "
+        f"{summary['faces']} faces; {summary['matched']} matched; {summary['unknown']} unknown; "
+        f"{summary['errors']} errors",
         f"Duration    : {duration:.1f}s  "
         f"(started {result['started_at'].replace('T', ' ')}, "
         f"finished {result['finished_at'].replace('T', ' ')})",
-        f"Speed       : {speed:.0f} images/min",
+        f"Speed       : {speed:.0f} images+frames/min",
     ]
     for worker in result.get("workers", []):
         status = f"  FAILED: {worker['failed']}" if worker.get("failed") else ""
         lines.append(f"Worker      : {worker['worker']} ({worker.get('host') or '?'}, {worker['provider']}, "
-                     f"{worker['threads']} threads): {worker['images']} images{status}")
+                     f"{worker['threads']} threads): {worker['images']} images/frames{status}")
     lines.append(f"Output      : {result['output']}")
     return "\n".join(lines)

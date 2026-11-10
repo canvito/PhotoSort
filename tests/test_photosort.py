@@ -7,16 +7,19 @@ import stat
 import sys
 import threading
 import zlib
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import photosort  # noqa: E402
 import photo_search  # noqa: E402
 import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
+import media  # noqa: E402
 
 BUCKETS = {"people": "", "food": "", "screenshot_chat": "", "other": ""}
 CFG = {"model": "fake", "concurrency": 4, "buckets": BUCKETS}
@@ -88,7 +91,7 @@ class FakeClassifier:
 
 
 def test_sort_move_then_undo(tmp_path):
-    for name in ["selfie.jpg", "lunch.JPG", "chat.png", "broken.jpg", "clip.mov"]:
+    for name in ["selfie.jpg", "lunch.JPG", "chat.png", "broken.jpg", "notes.txt"]:
         (tmp_path / name).write_bytes(b"x")
     (tmp_path / "people").mkdir()
     (tmp_path / "people" / "selfie.jpg").write_bytes(b"already sorted")
@@ -100,7 +103,7 @@ def test_sort_move_then_undo(tmp_path):
     assert (tmp_path / "people" / "selfie.jpg").read_bytes() == b"already sorted"
     assert (tmp_path / "food" / "lunch.JPG").exists()
     assert (tmp_path / "screenshot_chat" / "chat.png").exists()
-    assert (tmp_path / "broken.jpg").exists() and (tmp_path / "clip.mov").exists()
+    assert (tmp_path / "broken.jpg").exists() and (tmp_path / "notes.txt").exists()
     entries = [json.loads(x) for x in (tmp_path / photosort.JOURNAL_NAME).read_text().splitlines()]
     assert sum(1 for e in entries if e.get("error")) == 1
 
@@ -167,14 +170,14 @@ def test_format_duration(seconds, expected):
 
 
 def test_finish_report_shows_duration(tmp_path):
-    for name in ["selfie.jpg", "lunch.jpg", "clip.mov"]:
+    for name in ["selfie.jpg", "lunch.jpg", "notes.txt"]:
         (tmp_path / name).write_bytes(b"x")
     s = photosort.sort_folder(CFG, tmp_path, action="move", classifier=FakeClassifier())
     text = photosort.format_report(s)
     assert f"Duration    : {photosort.format_duration(s['elapsed_s'])}" in text
     assert s["started_at"].replace("T", " ") in text and s["finished_at"].replace("T", " ") in text
-    assert "2 images moved; 0 errors; 1 non-image files left in place" in text
-    assert "images/min" in text and "people" in text and "food" in text
+    assert "2 files moved (2 photos, 0 videos); 0 errors; 1 other files left in place" in text
+    assert "files/min" in text and "people" in text and "food" in text
     assert photosort.format_report({**s, "action": "report"}).count("no files changed") == 1
 
 
@@ -215,7 +218,8 @@ def test_face_tagger_matches_locally_and_writes_sidecar(tmp_path):
     result = face_tagger.tag_people(source, people, output, {".jpg"}, backend=FakeFaceBackend())
 
     assert result["provider"] == "CPUExecutionProvider"
-    assert result["summary"] == {"images": 3, "faces": 4, "matched": 2, "unknown": 2, "errors": 0}
+    assert result["summary"] == {"images": 3, "videos": 0, "video_frames": 0, "faces": 4, "matched": 2,
+                                 "unknown": 2, "errors": 0}
     data = json.loads(output.read_text(encoding="utf-8"))
     assert data["format"] == "photosort-faces-v1"
     by_file = {item["file"]: item for item in data["images"]}
@@ -493,3 +497,205 @@ def test_case_only_rename_leaves_one_index_entry(tmp_path):
 
     assert (s["reused"], s["removed"], s["total_indexed"]) == (1, 1, 1)
     assert [Path(x["path"]).name for x in photo_search.search_index(CFG, "cat", client)["results"]] == ["CAT.jpg"]
+
+
+COLORS = {"red": (255, 0, 0), "blue": (0, 0, 255), "green": (0, 128, 0), "yellow": (255, 255, 0),
+          "white": (255, 255, 255)}
+
+
+def make_video(path, colors, fps=10, gop=10, size=(64, 48)):
+    """A small mpeg4 video showing one solid color per second, with a keyframe every `gop` frames."""
+    av = pytest.importorskip("av")
+    with av.open(str(path), "w") as out:
+        stream = out.add_stream("mpeg4", rate=fps)
+        stream.width, stream.height = size
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.gop_size = gop
+        stream.codec_context.options = {"sc_threshold": "1000000000"}  # no extra keyframes at color changes
+        for i in range(len(colors) * fps):
+            frame = av.VideoFrame.from_image(Image.new("RGB", size, colors[i // fps]))
+            frame.pts, frame.time_base = i, Fraction(1, fps)
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode():
+            out.mux(packet)
+    return path.read_bytes()
+
+
+def color_of(im):
+    pixel = im.convert("RGB").getpixel((im.width // 2, im.height // 2))
+    return min(COLORS, key=lambda name: sum((a - b) ** 2 for a, b in zip(COLORS[name], pixel)))
+
+
+def test_video_frames_are_spread_over_time_and_face_mode_fills_keyframe_gaps(tmp_path):
+    colors = ["red", "red", "blue", "green", "yellow", "white"]
+    make_video(tmp_path / "keyframe_every_second.mp4", colors * 2)
+    make_video(tmp_path / "keyframes_3s_apart.mp4", colors, gop=30)
+
+    frames = list(media.video_frames(tmp_path / "keyframe_every_second.mp4"))
+    times = [t for t, _ in frames]
+    assert len(frames) == media.VIDEO_FRAMES and times == sorted(times) and times[-1] - times[0] > 8
+    assert all(t == int(t) for t in times)  # whole keyframes when there are enough of them
+    assert [color_of(im) for _, im in frames] == [(colors * 2)[int(t)] for t in times]
+
+    sparse = list(media.video_frames(tmp_path / "keyframes_3s_apart.mp4"))
+    assert len(sparse) == media.VIDEO_FRAMES  # frames between keyframes decode to the right picture
+    assert [color_of(im) for _, im in sparse] == [colors[int(t)] for t, _ in sparse]
+    faces = [t for t, _ in media.video_frames(tmp_path / "keyframes_3s_apart.mp4", count=None)]
+    assert faces == pytest.approx([0, 1, 2, 3, 4, 5])
+
+
+@pytest.mark.parametrize("rotation,size,top_left", [(0, (2, 1), "red"), (-90, (1, 2), "red"),
+                                                    (90, (1, 2), "blue"), (180, (2, 1), "blue")])
+def test_rotated_video_frames_are_turned_upright(rotation, size, top_left):
+    class Frame:  # stored picture: red left half, blue right half
+        def __init__(self):
+            self.rotation = rotation
+
+        def to_image(self):
+            im = Image.new("RGB", (2, 1), "red")
+            im.putpixel((1, 0), COLORS["blue"])
+            return im
+
+    im = media._upright(Frame())  # -90 = phone portrait video: turn 90 degrees clockwise for display
+    assert im.size == size and im.getpixel((0, 0)) == COLORS[top_left]
+
+
+class FakeChat:
+    """Stands in for the PAIR proxy: records each request and answers with the next reply (the last one repeats).
+    A reply is the message text, or (text, done_reason)."""
+
+    def __init__(self, *replies):
+        self.replies, self.bodies = replies, []
+
+    def post(self, url, json, timeout):
+        self.bodies.append(json)
+        reply = self.replies[min(len(self.bodies), len(self.replies)) - 1]
+        content, done = reply if isinstance(reply, tuple) else (reply, "stop")
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"message": {"content": content}, "done_reason": done}
+
+        return Response()
+
+
+LOCAL = {"base_url": "http://127.0.0.1:11434", "max_side": 256, "timeout_s": 5, "retries": 1}
+
+
+def test_video_is_sorted_from_frames_in_time_order_and_moved_unchanged(tmp_path):
+    original = make_video(tmp_path / "clip.mov", ["red", "blue", "green"])
+    Image.new("RGB", (40, 30), "red").save(tmp_path / "photo.jpg")
+    cfg = {**CFG, **LOCAL, "model": "gemma4:12b"}
+    chat = FakeChat('{"bucket": "people", "confidence": 0.9}')
+    clf = photosort.Classifier(cfg)
+    clf._session = lambda: chat
+
+    s = photosort.sort_folder(cfg, tmp_path, action="move", classifier=clf)
+
+    assert (s["sorted"], s["videos"], s["errors"]) == (2, 1, 0)
+    assert (tmp_path / "people" / "clip.mov").read_bytes() == original
+    prompts = {len(b["messages"][0]["images"]): b["messages"][0]["content"] for b in chat.bodies}
+    assert prompts[8].startswith("Here are 8 frames, in time order, from one video")
+    assert prompts[1].startswith("Sort this image")
+    assert all(b["options"]["num_ctx"] == 4096 for b in chat.bodies)
+
+
+def test_video_is_captioned_from_frames_and_found_by_search(tmp_path):
+    make_video(tmp_path / "beach.mov", ["yellow", "blue"])
+    make_photos(tmp_path, ["cat.jpg"])
+    pair = photo_search.PairSearchClient({**CFG, **LOCAL}, photosort.encode_image)
+    chat = FakeChat(json.dumps(FAKE_CAPTIONS["beach"]))
+    pair._session = lambda: chat
+    assert pair.caption(tmp_path / "beach.mov")["caption"] == FAKE_CAPTIONS["beach"]["caption"]
+    message = chat.bodies[0]["messages"][0]
+    assert len(message["images"]) == 8 and message["content"] == photo_search.VIDEO_PROMPT
+
+    client = FakeSearchClient()
+    s = photo_search.index_folder(CFG, tmp_path, client, photosort.MEDIA_EXTS)
+    assert (s["images"], s["videos"], s["captioned"]) == (2, 1, 2)
+    assert Path(top_hit("video of kids at the beach", client)["path"]).name == "beach.mov"
+    again = photo_search.index_folder(CFG, tmp_path, client, photosort.MEDIA_EXTS)
+    assert (again["captioned"], again["unchanged"]) == (0, 2)
+
+
+def test_caption_cut_off_by_a_repetition_loop_is_redone_with_the_text_field_capped(tmp_path):
+    Image.new("RGB", (40, 30), "red").save(tmp_path / "cat.jpg")
+    pair = photo_search.PairSearchClient({**CFG, **LOCAL, "retries": 3}, photosort.encode_image)
+    chat = FakeChat(('{"caption": "a sign", "text": "SALE SALE SALE SALE', "length"), json.dumps(FAKE_CAPTIONS["beach"]))
+    pair._session = lambda: chat
+    assert pair.caption(tmp_path / "cat.jpg")["caption"] == FAKE_CAPTIONS["beach"]["caption"]
+    caps = [b["format"]["properties"]["text"].get("maxLength") for b in chat.bodies]
+    assert caps == [None, photo_search.TEXT_LIMIT]
+    assert chat.bodies[0]["format"] == photo_search.SCHEMA  # normal captions are requested exactly as before
+
+    looping = FakeChat(('{"caption": "a sign", "text": "SALE SALE', "length"))
+    pair._session = lambda: looping
+    with pytest.raises(photo_search.SearchError, match="length limit"):
+        pair.caption(tmp_path / "cat.jpg")
+    # the looping request is never resent as is; the other attempts may reach a node that does not loop
+    assert [b["format"]["properties"]["text"].get("maxLength") for b in looping.bodies] == [None, 300, 300]
+
+
+class ColorFaceBackend(FakeFaceBackend):
+    """Reference photos by file name; in video frames red shows Alice, blue shows Bob and green shows nobody."""
+    concurrency = 2  # parallel path: video frames are prepared in worker processes
+
+    def detect(self, source):
+        if isinstance(source, Path):
+            return super().detect(source)
+        vector = {"red": [1.0, 0.0], "blue": [0.0, 1.0]}.get(color_of(Image.open(io.BytesIO(source))))
+        return [{"embedding": vector, "bbox": [1, 2, 30, 40]}] if vector else []
+
+
+def test_face_tagger_samples_video_frames_and_records_when_people_appear(tmp_path):
+    source, people = _face_fixture(tmp_path)  # includes clip.mov, which is not a real video
+    original = make_video(source / "party.mp4", ["red", "red", "blue", "green", "green", "red"])
+
+    result = face_tagger.tag_people(source, people, None, {".jpg"}, backend=ColorFaceBackend(),
+                                    video_exts=media.VIDEO_EXTS)
+
+    s = result["summary"]
+    assert (s["images"], s["videos"], s["video_frames"], s["errors"]) == (3, 2, 6, 1)
+    by_file = {r["file"]: r for r in json.loads(Path(result["output"]).read_text(encoding="utf-8"))["images"]}
+    party = by_file["party.mp4"]  # 6 frames = 2 jobs, merged back in time order
+    assert party["type"] == "video" and party["frames"] == 6 and party["people"] == {"Alice": 3, "Bob": 1}
+    assert [(f["time_s"], f["person"]) for f in party["faces"]] == [
+        (0.0, "Alice"), (1.0, "Alice"), (2.0, "Bob"), (5.0, "Alice")]
+    assert by_file["clip.mov"]["type"] == "video" and "error" in by_file["clip.mov"]
+    assert "time_s" not in by_file["alice.jpg"]["faces"][0]
+    assert (source / "party.mp4").read_bytes() == original
+    assert "3 images, 2 videos (6 frames)" in face_tagger.format_face_report(result)
+
+
+def test_video_frame_png_is_lossless():
+    pixels = np.random.default_rng(0).integers(0, 256, (37, 53, 3), dtype=np.uint8)
+    with Image.open(io.BytesIO(media.png_bytes(Image.fromarray(pixels)))) as back:
+        assert back.mode == "RGB" and np.array_equal(np.asarray(back), pixels)
+
+
+def frames_or_crash(path, picks):
+    """Runs in a frame pool process; a file named crash* kills its process like a decoder crash would."""
+    if Path(path).name.startswith("crash"):
+        os._exit(3)
+    return [(seconds, b"png") for seconds in picks]
+
+
+def test_a_crashed_frame_process_fails_only_its_own_video():
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    pool = face_tagger._FramePool(2, frames_or_crash)
+    try:
+        names = ["a.mov", "crash.mov", "b.mov", "c.mov", "d.mov"]
+        with ThreadPoolExecutor(len(names)) as threads:
+            futures = {name: threads.submit(pool.frames, name, [1.0]) for name in names}
+        assert isinstance(futures["crash.mov"].exception(), BrokenProcessPool)
+        assert {n: f.result() for n, f in futures.items() if n != "crash.mov"} == {
+            n: [(1.0, b"png")] for n in names if n != "crash.mov"}
+        assert pool.frames("e.mov", [2.0]) == [(2.0, b"png")]
+    finally:
+        pool.shutdown()

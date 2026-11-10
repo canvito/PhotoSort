@@ -22,21 +22,34 @@ import numpy as np
 import requests
 
 from local_only import require_local_models, require_loopback
+from media import is_video, video_jpegs
 
 log = logging.getLogger("photosort.search")
 
 DEFAULT_INDEX = os.path.join("%LOCALAPPDATA%", "PhotoSort", "search_index.sqlite")
 DEFAULTS = {"caption_model": "gemma4:12b", "embed_model": "qwen3-embedding:8b", "index_concurrency": 12}
 PROMPT_VERSION = 1
+VIDEO_PROMPT_VERSION = 1
 TEXT_LIMIT = 300
 PROMPT = ("Describe this image for a private photo search index. Reply with JSON only: "
           '{"caption": "2-3 factual sentences: subjects, actions, setting, notable colors/objects", '
           '"objects": ["key nouns"], "scene": "indoor/outdoor/screen + place type", '
           '"text": "important visible text verbatim, max 300 chars, empty if none", "people_count": 0}')
+VIDEO_PROMPT = ("These are frames, in time order, from one video. Describe the whole video for a private search "
+                'index. Reply with JSON only: {"caption": "2-3 factual sentences: subjects, what happens, setting, '
+                'notable colors/objects", "objects": ["key nouns"], "scene": "indoor/outdoor/screen + place type", '
+                '"text": "important visible text verbatim, max 300 chars, empty if none", '
+                '"people_count": "most people visible in one frame"}')
 SCHEMA = {"type": "object", "required": ["caption", "objects", "scene", "text", "people_count"],
           "properties": {"caption": {"type": "string"}, "objects": {"type": "array", "items": {"type": "string"}},
                          "scene": {"type": "string"}, "text": {"type": "string"},
                          "people_count": {"type": "integer"}}}
+# Used only to redo a caption whose reply ran to the length limit: on some nodes gemma4 repeats a video's visible
+# text without end. The cap makes it close the field at TEXT_LIMIT, where longer text is cut anyway; caption,
+# objects and scene come first in the reply, so they are what the normal request gives. (A repeat penalty fixed it
+# on only some nodes.) Normal captions are requested without the cap, so they stay exactly as before.
+TEXT_CAPPED_SCHEMA = {**SCHEMA, "properties": {**SCHEMA["properties"],
+                                               "text": {"type": "string", "maxLength": TEXT_LIMIT}}}
 # qwen3-embedding is instruction-tuned: queries carry a task prefix, indexed documents do not.
 QUERY_INSTRUCT = "Instruct: Given a photo search query, retrieve the description of the matching photo\nQuery: "
 
@@ -68,6 +81,10 @@ class SearchError(RuntimeError):
     pass
 
 
+class ReplyCutOff(ValueError):
+    pass
+
+
 def settings(cfg: dict) -> dict:
     s = {**DEFAULTS, **{k: cfg[k] for k in DEFAULTS if k in cfg}}
     s["index_path"] = index_path(cfg)
@@ -94,8 +111,8 @@ def normalize_caption(data: dict) -> dict:
             "text": str(data.get("text") or "").strip()[:TEXT_LIMIT], "people_count": people}
 
 
-def visual_doc(c: dict) -> str:
-    return (f"{c['caption']} Scene: {c['scene']}. Objects: {', '.join(c['objects'])}. "
+def visual_doc(c: dict, video: bool = False) -> str:
+    return (f"{'Video: ' if video else ''}{c['caption']} Scene: {c['scene']}. Objects: {', '.join(c['objects'])}. "
             f"People: {c['people_count']}.")
 
 
@@ -138,7 +155,9 @@ class PairSearchClient:
             raise SearchError(f"model(s) not available in the PAIR cluster: {', '.join(missing)}")
         require_local_models(models, available)
 
-    def _post(self, endpoint: str, body: dict, parse: Callable[[dict], object]):
+    def _post(self, endpoint: str, body: dict, parse: Callable[[dict], object], if_cut_off: dict | None = None):
+        """POST with retries. After a reply cut off at the length limit, the remaining attempts send `if_cut_off`
+        instead, if given: at temperature 0 the same request would loop the same way again."""
         err = "no attempts"
         for attempt in range(self.retries):
             try:
@@ -148,15 +167,27 @@ class PairSearchClient:
             except (requests.RequestException, ValueError, KeyError, TypeError) as e:
                 err = f"{type(e).__name__}: {str(e)[:200]}"
                 log.debug("retry %d %s: %s", attempt + 1, endpoint, err)
+                if isinstance(e, ReplyCutOff) and if_cut_off is not None:
+                    body = if_cut_off
+                    continue
                 time.sleep(min(2 ** attempt, 10))
         raise SearchError(err)
 
     def caption(self, path: Path) -> dict:
+        if is_video(path):
+            images, prompt = video_jpegs(path, self.max_side), VIDEO_PROMPT
+        else:
+            images, prompt = [self.encode_image(path, self.max_side)], PROMPT
         body = {"model": self.s["caption_model"], "stream": False, "think": False, "format": SCHEMA,
                 "keep_alive": "30m", "options": {"temperature": 0, "num_predict": 1024, "num_ctx": 4096},
-                "messages": [{"role": "user", "content": PROMPT,
-                              "images": [self.encode_image(path, self.max_side)]}]}
-        return self._post("/api/chat", body, lambda j: normalize_caption(json.loads(j["message"]["content"])))
+                "messages": [{"role": "user", "content": prompt, "images": images}]}
+
+        def parse(j):
+            if j.get("done_reason") == "length":
+                raise ReplyCutOff("caption reply hit the length limit (the model repeated itself)")
+            return normalize_caption(json.loads(j["message"]["content"]))
+
+        return self._post("/api/chat", body, parse, if_cut_off={**body, "format": TEXT_CAPPED_SCHEMA})
 
     def embed(self, texts: list[str], query: bool = False) -> np.ndarray:
         inputs = [QUERY_INSTRUCT + t for t in texts] if query else list(texts)
@@ -218,17 +249,21 @@ def _try_sha256(path: Path) -> str | None:
         return None
 
 
+def prompt_version(path: Path) -> int:
+    return VIDEO_PROMPT_VERSION if is_video(path) else PROMPT_VERSION
+
+
 def _analyze(client, path: Path) -> dict:
     c = client.caption(path)
-    docs = [visual_doc(c)] + ([text_doc(c)] if c["text"] else [])
+    docs = [visual_doc(c, is_video(path))] + ([text_doc(c)] if c["text"] else [])
     vecs = client.embed(docs)
     return {**c, "vec_visual": to_blob(vecs[0]), "vec_text": to_blob(vecs[1]) if len(vecs) > 1 else None}
 
 
 def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], limit: int = 0,
                  concurrency: int | None = None) -> dict:
-    """Caption + embed every image under source (recursively). Unchanged files are skipped and moved or
-    duplicated files are matched by SHA-256, so re-running only sends new photos to the cluster."""
+    """Caption + embed every photo and video under source (recursively). Unchanged files are skipped and moved or
+    duplicated files are matched by SHA-256, so re-running only sends new files to the cluster."""
     started, t_start = datetime.now(), time.perf_counter()
     s = settings(cfg)
     workers = concurrency or s["index_concurrency"]
@@ -240,7 +275,7 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
     current = {str(p) for p in files}
     current_nc = {os.path.normcase(p) for p in current}
     files = files[: limit or None]
-    model_key = (s["caption_model"], s["embed_model"], PROMPT_VERSION)
+    models = (s["caption_model"], s["embed_model"])
     db = open_index(s["index_path"])
     key = _folder_key(source)
     known = {row[0]: row[1:] for row in db.execute(
@@ -249,11 +284,11 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
     todo, unchanged = [], 0
     for p in files:
         st = p.stat()
-        if known.get(str(p)) == (st.st_size, st.st_mtime_ns, *model_key):
+        if known.get(str(p)) == (st.st_size, st.st_mtime_ns, *models, prompt_version(p)):
             unchanged += 1
         else:
             todo.append((p, st))
-    log.info("index %s: %d images, %d unchanged, %d to check; captions=%s embeddings=%s workers=%d",
+    log.info("index %s: %d files, %d unchanged, %d to check; captions=%s embeddings=%s workers=%d",
              source, len(files), unchanged, len(todo), s["caption_model"], s["embed_model"], workers)
 
     counts = {"captioned": 0, "reused": 0, "errors": 0}
@@ -261,7 +296,7 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
     def store(path: Path, st, sha: str, fields: dict) -> None:
         row = {"path": str(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha,
                "caption_model": s["caption_model"], "embed_model": s["embed_model"],
-               "prompt_version": PROMPT_VERSION, "objects": json.dumps(fields["objects"]),
+               "prompt_version": prompt_version(path), "objects": json.dumps(fields["objects"]),
                "indexed_at": datetime.now().isoformat(timespec="seconds"),
                **{k: fields[k] for k in ("caption", "scene", "text", "people_count", "vec_visual", "vec_text")}}
         db.execute(f"INSERT OR REPLACE INTO photos ({', '.join(COLUMNS)}) VALUES ({', '.join('?' * len(COLUMNS))})",
@@ -278,7 +313,7 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
             match = db.execute(
                 "SELECT caption, scene, objects, text, people_count, vec_visual, vec_text FROM photos "
                 "WHERE sha256 = ? AND caption_model = ? AND embed_model = ? AND prompt_version = ? LIMIT 1",
-                (hashes[p], *model_key)).fetchone()
+                (hashes[p], *models, prompt_version(p))).fetchone()
             if match:  # same bytes already indexed (moved, renamed or duplicated): no model call needed
                 fields = dict(zip(("caption", "scene", "objects", "text", "people_count", "vec_visual",
                                    "vec_text"), match))
@@ -316,7 +351,8 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
         db.close()
     elapsed = time.perf_counter() - t_start
     return {"source": str(source), "index_path": str(s["index_path"]), "caption_model": s["caption_model"],
-            "embed_model": s["embed_model"], "workers": workers, "images": len(files), "unchanged": unchanged,
+            "embed_model": s["embed_model"], "workers": workers, "images": len(files),
+            "videos": sum(map(is_video, files)), "unchanged": unchanged,
             **counts, "removed": len(stale), "total_indexed": total,
             "started_at": started.isoformat(timespec="seconds"),
             "finished_at": datetime.now().isoformat(timespec="seconds"), "elapsed_s": round(elapsed, 1),
