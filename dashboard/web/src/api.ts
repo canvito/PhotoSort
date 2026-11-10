@@ -209,8 +209,29 @@ export interface SysEvent {
   [k: string]: unknown;
 }
 
-// Job events go to whoever listens (job page, dock, lists) through one bus, so the app keeps a single stream.
+/** What the server sends on the "index" stream: the search vectors loading into memory, or the index changed. */
+export interface IndexEvent {
+  type: 'loading' | 'changed' | 'reconnected';
+  done?: number;
+  total?: number;
+  generation?: number;
+}
+
+// Job and index events go to whoever listens (job page, dock, lists, gallery) through buses, so the app keeps a
+// single stream.
 const jobBus = new EventTarget();
+const indexBus = new EventTarget();
+
+/** Calls `cb` for every index event, and with `{type: 'reconnected'}` after the stream reconnects. */
+export function useIndexEvents(cb: (e: IndexEvent) => void): void {
+  const handler = useRef(cb);
+  handler.current = cb;
+  useEffect(() => {
+    const on = (e: Event) => handler.current((e as CustomEvent<IndexEvent>).detail);
+    indexBus.addEventListener('index', on);
+    return () => indexBus.removeEventListener('index', on);
+  }, []);
+}
 
 /** Calls `cb` for every job event, and with `{type: 'reconnected'}` after the stream reconnects (events may have
  * been missed, so listeners reload). */
@@ -234,7 +255,10 @@ export function useServerEvents(onSys: (e: SysEvent) => void): boolean {
     let opened = false;
     es.onopen = () => {
       setConnected(true);
-      if (opened) jobBus.dispatchEvent(new CustomEvent('job', { detail: { type: 'reconnected' } }));
+      if (opened) {
+        jobBus.dispatchEvent(new CustomEvent('job', { detail: { type: 'reconnected' } }));
+        indexBus.dispatchEvent(new CustomEvent('index', { detail: { type: 'reconnected' } }));
+      }
       opened = true;
     };
     es.onerror = () => setConnected(false);
@@ -253,6 +277,15 @@ export function useServerEvents(onSys: (e: SysEvent) => void): boolean {
         return;
       }
       jobBus.dispatchEvent(new CustomEvent('job', { detail }));
+    });
+    es.addEventListener('index', (m) => {
+      let detail: IndexEvent;
+      try {
+        detail = JSON.parse((m as MessageEvent<string>).data) as IndexEvent;
+      } catch {
+        return;
+      }
+      indexBus.dispatchEvent(new CustomEvent('index', { detail }));
     });
     return () => es.close();
   }, []);

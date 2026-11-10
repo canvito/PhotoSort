@@ -9,6 +9,8 @@ import { DirRegistry } from './dirs.ts';
 import { JobManager } from './jobs.ts';
 import { registerJobRoutes } from './routes.ts';
 import { cachedProbe } from './pyinfo.ts';
+import { Sidecar } from './sidecar.ts';
+import { registerGalleryRoutes } from './gallery.ts';
 
 declare module 'fastify' {
   interface FastifyContextConfig {
@@ -53,6 +55,7 @@ export interface App {
   hub: SseHub;
   jobs: JobManager;
   dirs: DirRegistry;
+  sidecar: Sidecar;
 }
 
 const startedAt = new Date().toISOString();
@@ -83,6 +86,8 @@ export async function buildApp(opts: AppOptions): Promise<App> {
   });
   await jobs.init();
   registerJobRoutes(app, jobs, dirs);
+  const sidecar = new Sidecar({ ...opts, hub });
+  registerGalleryRoutes(app, sidecar, dirs);
   const pythonInfo = cachedProbe(opts.python, opts.photosortDir);
 
   app.get('/healthz', { config: { auth: 'public' } }, async () => ({ ok: true, version: opts.version, mode: opts.mode }));
@@ -154,6 +159,6 @@ export async function buildApp(opts: AppOptions): Promise<App> {
     return reply.sendFile(inside ? rel : 'index.html', { cacheControl: false });
   });
 
-  app.addHook('onClose', async () => { await jobs.close(); });
-  return { app, hub, jobs, dirs };
+  app.addHook('onClose', async () => { await Promise.all([jobs.close(), sidecar.close()]); });
+  return { app, hub, jobs, dirs, sidecar };
 }

@@ -21,6 +21,15 @@ const paths: Record<string, ReactElement> = {
   play: <><path d="M6.5 4.5v11l9-5.5z" /></>,
   x: <><path d="m5 5 10 10M15 5 5 15" /></>,
   chevron: <><path d="m8 5 5 5-5 5" /></>,
+  video: <><rect x="2.5" y="5" width="11" height="10" rx="1.5" /><path d="m13.5 9 4-2.5v7l-4-2.5" /></>,
+  image: <><rect x="3" y="4" width="14" height="12" rx="1.5" /><circle cx="7.5" cy="8.5" r="1.3" /><path d="m3.5 14.5 4-4 3 3 2-2 4 4" /></>,
+  cloud: <><path d="M6 15.5h8.5a3.5 3.5 0 0 0 .4-7A5 5 0 0 0 5.3 9 3.3 3.3 0 0 0 6 15.5z" /></>,
+  refresh: <><path d="M16 10a6 6 0 1 1-1.8-4.3" /><path d="M16.5 3.5V7H13" /></>,
+  frames: <><rect x="2.5" y="6" width="15" height="8" rx="1" /><path d="M7.5 6v8M12.5 6v8" /></>,
+  similar: <><path d="M10 3v3.5M10 13.5V17M3 10h3.5M13.5 10H17M5.6 5.6l2 2M12.4 12.4l2 2M14.4 5.6l-2 2M7.6 12.4l-2 2" /></>,
+  alert: <><path d="M10 3 2.5 16.5h15z" /><path d="M10 8.5V12M10 14.5v.01" /></>,
+  browse: <><rect x="3" y="3" width="6" height="6" rx="1" /><rect x="11" y="3" width="6" height="6" rx="1" /><rect x="3" y="11" width="6" height="6" rx="1" /><rect x="11" y="11" width="6" height="6" rx="1" /></>,
+  index: <><ellipse cx="10" cy="5" rx="6" ry="2.5" /><path d="M4 5v10c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5V5M4 10c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5" /></>,
 };
 
 export function Icon({ name, size = 18 }: { name: keyof typeof paths | string; size?: number }) {

@@ -19,8 +19,8 @@ confidence) and a group folder's `_photosort_group.json` (your request). The sea
 See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
 The [Dashboard](#dashboard-dashboardps1), a desktop window, runs sort, group, index, apply and undo for you, with
-live progress (search, browsing and faces come in later phases). Start it with `.\dashboard.ps1` and stop it with
-`.\dashboard.ps1 stop`.
+live progress, and searches and browses the index with thumbnails (faces come in a later phase). Start it with
+`.\dashboard.ps1` and stop it with `.\dashboard.ps1 stop`.
 
 ## Setup (once)
 
@@ -439,10 +439,11 @@ pack is intended for personal/non-commercial use; review the model license befor
 
 ## Dashboard (`dashboard.ps1`)
 
-A desktop window for PhotoSort, built in phases. **Now (P1):** the window, its local server, PAIR health, the
-privacy checks, and **jobs**: sort, group, index, apply and undo run from the window with live progress. Later
-phases: P2 adds search, browsing and thumbnails; P3 the full runs history, the cluster view and live privacy
-checks; P4 faces and settings. Until then those pages show the matching CLI command.
+A desktop window for PhotoSort, built in phases. **Now (v1 = P0–P2):** the window, its local server, PAIR
+health, the privacy checks, **jobs** (sort, group, index, apply and undo with live progress) and **search and
+gallery** (plain-language search, browsing the whole index, thumbnails, previews and video playback). Later
+phases: P3 the full runs history, the cluster view and live privacy checks; P4 faces and settings. Until then
+those pages show the matching CLI command.
 
 ```powershell
 cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
@@ -482,7 +483,7 @@ PhotoSort's own folders.
 |---|---|
 | **Sort** | Preview, move or copy into buckets; optional destination, subfolders, and advanced limit, parallel requests, model and `--force` |
 | **Group** | A plain-language request (up to 500 characters, with examples); advanced folder name, From/To dates (To empty = today), photos/videos/both |
-| **Index** | Builds or refreshes the search index (unchanged files are skipped). Searching itself arrives in P2; until then use `.\photosort.cmd search` |
+| **Index** | Builds or refreshes the search index (unchanged files are skipped). It is the third tab of the Search page; results show up in Search and Browse as soon as the job finishes |
 | **Runs** | Every job with its result, filtered by kind; **Undo a folder's last run** previews undoing the latest run in that folder's journal |
 | **Job** (`/jobs/<id>`) | Live progress, the per-file list (virtualized), what a group request understood, the finish report and its duration, and the next step: **Move these N files** or **Copy instead** after a preview, **Undo this run…** (a preview), then **Move N files back now**, or **Edit and run again**. A refused group request or a locked folder offers fixes (**Retry with photos only**, **Set the dates…**, **Run anyway…**) |
 
@@ -520,7 +521,7 @@ PhotoSort's own folders.
   host names. It also turns off proxies, WebRTC UDP, navigation, new windows, downloads, permissions and
   spell-check downloads.
 - Content protection is on: screenshots and screen sharing see a black window. The shield chip in the top bar
-  turns it off, e.g. to share the screen. The Blur chip (Ctrl+Shift+B) will blur thumbnails (P2).
+  turns it off, e.g. to share the screen. The Blur chip (Ctrl+Shift+B) blurs thumbnails and text.
 - The page has no access to Node.js or files.
 - Check it with `.\dashboard.ps1 start -Fixture -NoOpen`, then `.\dashboard.ps1 selftest -Fixture` (8 checks),
   then `.\dashboard.ps1 stop -Fixture`.
@@ -538,10 +539,45 @@ model runs on this PC.
   - `shell.json`: the window's process;
   - `logs\`: `server-*`, `shell-*` and `setup-*` logs, which hold events and counts, no file names;
   - `jobs\<id>\`: each job's record, events and CLI output (these do hold file names, like a terminal would);
+  - `thumbs\`: the thumbnail and preview cache (metadata-free WebP, at most 3 GB); `media.key`: the secret for
+    item ids;
   - `shell\`: the window's browser cache.
 - `%LOCALAPPDATA%\PhotoSort\dashboard-fixture`: the same for `-Fixture`, plus the synthetic `library\`.
 - `%LOCALAPPDATA%\PhotoSort\locks`: the CLI's folder locks (see [Usage](#usage)), shared by both modes.
 - `dashboard\node_modules` and `dashboard\web\dist` are git-ignored.
+
+### Search and gallery
+
+The **Search** page has three tabs: **Search** (default), **Browse** and **Index** (the index job form).
+
+- **Search:** type a plain-language request; it runs after a 250 ms pause or on Enter, and a newer search
+  cancels an older one. Filters: photos/videos/both, folder (from the picker, subfolders included), minimum
+  score and number of results (up to 500). The status line shows the search time, how many items were searched
+  and how many were skipped because they were indexed with another embedding model. `/` jumps to the box.
+- **Browse:** every indexed photo and video, by name, folder or index date, loaded 200 at a time as you scroll.
+- **Grid:** only visible rows are drawn; arrows, Page Up/Down, Home/End move, Enter opens, Escape closes.
+- **Detail pane:** the caption, scene, objects and visible text (fetched only when you open an item), a large
+  preview, video playback with seeking (or an 8-frame strip when the format can't play in the window, or with
+  **Show frames**), **Reveal in Explorer** and **Find similar** (searches with the caption).
+- **Refresh** reloads the lists; **Clear cache** deletes the thumbnail cache. Index changes made by jobs or the
+  CLI (index, sort, undo) show up automatically.
+
+How it works:
+- Search uses the **same scoring as `photosort.cmd search`** (the best of the caption and visible-text matches,
+  ties in index order); a test checks the two give identical results. The query is embedded by
+  `qwen3-embedding:8b` through PAIR on `127.0.0.1` (same local-only guard); nothing runs on this PC's GPU.
+- A private Python helper (`dashboard_sidecar.py`, started by the server, talking over a pipe, no network
+  port) keeps the vectors in memory after the first search (~1 GB for 31,000 items), and rereads the index only
+  when it changes. The index is opened read-only.
+- Thumbnails (256 px) and previews (1,600 px) are made on this PC by up to 3 low-priority processes, as WebP
+  **with all metadata removed** (no EXIF, GPS or ICC). They are cached in
+  `%LOCALAPPDATA%\PhotoSort\dashboard\thumbs` (at most 3 GB, oldest removed first) and remade when a file
+  changes. Videos use their own frames, decoded locally with PyAV.
+- **Cloud-only OneDrive files are never downloaded:** they show "Cloud-only file". To see them, choose **Always
+  keep on this device** in Explorer, then **Refresh**.
+- The page sees items by opaque ids, never paths it could choose; the server only serves files that are in the
+  index. Query text, captions and file names are not logged.
+- **Blur** (Ctrl+Shift+B) blurs thumbnails and text, e.g. when someone is looking.
 
 **Measured on this PC (2026-11-10):**
 
@@ -557,6 +593,11 @@ model runs on this PC.
 | A file's progress reaching the window (CLI event to page, fixture run) | median 191 ms, p95 285 ms (target ≤ 500 ms) |
 | Fixture sort preview, 50 files, fake PAIR | 1.9 s |
 | `stop` while a job runs, with `-Yes` (stops the job safely first) | 1.0 s |
+| Search, 31,000 synthetic items × 4,096 dimensions: first load of the list / vectors (once) | 1.7 s / 1.6 s |
+| Search over those 31,000, vectors in memory (without the embedding call) | median 89 ms, p95 137 ms |
+| First page of Browse (200 items, 31,000 indexed) | 0.23 s |
+| Fixture search through the server, 50 items, fake PAIR (round trip) | 57 ms |
+| First thumbnail (starts the worker processes) / next ones | 1.1 s / ~20 ms |
 
 **Troubleshooting:**
 - "The server did not start": read `logs\server-crash.log` or `logs\server-<date>.log` in the data folder.
@@ -717,7 +758,7 @@ Dashboard (after `.\dashboard.ps1 setup -Fixture -Yes`), with its private Node.j
 ```powershell
 cd dashboard
 $env:PATH = (Get-ChildItem "$env:LOCALAPPDATA\PhotoSort\runtime\node-v*-win-x64" | Select-Object -Last 1).FullName + ";$env:PATH"
-npm run typecheck; npm test; npm run build   # 44 tests, ~20 s; the build also scans the bundle for outside URLs
+npm run typecheck; npm test; npm run build   # 50 tests, ~20 s; the build also scans the bundle for outside URLs
 cd ..
 .\dashboard.ps1 start -Fixture -NoOpen; .\dashboard.ps1 selftest -Fixture; .\dashboard.ps1 stop -Fixture
 ```
@@ -729,4 +770,8 @@ model) and runs the real `photosort.py` through the server. It covers preview, a
 sort and group; index and the skip on re-index; a safe stop in the middle of a move (every moved file is
 journaled, none lost); and the time from a CLI event to the page (p95 ≤ 500 ms). The tests find Python through
 `PHOTOSORT_PYTHON`, else `photosort.cmd`'s `PY`. `make_fixtures.py --reset` rebuilds the fixture library of
-fixture mode.
+fixture mode. `server\test\gallery.test.ts` builds a synthetic indexed library
+(`dashboard\fixtures\make_search_fixture.py`) and checks search, browsing, thumbnails, video ranges, live index
+refresh and that forged ids and paths are refused; `tests\test_dashboard_sidecar.py` checks that cached search
+equals the CLI's, metadata stripping, the cache limit and that cloud-only files are never opened. For the 31,000
+item measurement: `make_search_fixture.py --out <new folder in %TEMP%> --count 31000`.

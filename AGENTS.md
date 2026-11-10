@@ -152,11 +152,13 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
-## Dashboard (`dashboard.ps1`, phase P1: jobs)
+## Dashboard (`dashboard.ps1`, v1: phases P0–P2)
 
 Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify; jobs in `jobs.ts`, routes in
-`routes.ts`, folder picker in `dirs.ts`), `dashboard\shell` (Electron window), `dashboard\web` (React SPA; pages
-in `web\src\pages`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
+`routes.ts`, folder picker in `dirs.ts`, search/gallery routes in `gallery.ts`, its Python helper in
+`sidecar.ts`), `dashboard_sidecar.py` and `thumbs.py` (cached search, index browsing, metadata-free thumbnails),
+`dashboard\shell` (Electron window), `dashboard\web` (React SPA; pages in `web\src\pages`, grid in
+`components\Gallery.tsx`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
 
 - **Agents use fixture mode only:** `.\dashboard.ps1 <command> -Fixture -Yes`. Fixture mode has a synthetic
   library, a fake PAIR on `127.0.0.1:47617` (the server starts it and it exits with the server), its own data
@@ -164,8 +166,9 @@ in `web\src\pages`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode
   real mode (no `-Fixture`); the user does that.
 - In real mode, the only output you may read is `.\dashboard.ps1 status`, which shows counts and versions, no
   paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard`: its `state.json` holds the token, the logs and window
-  cache are the user's, and `jobs\<id>\` (`job.json`, `events.jsonl`, `stdout.txt`, `stderr.txt`) holds file names
-  and per-file results.
+  cache are the user's, `jobs\<id>\` (`job.json`, `events.jsonl`, `stdout.txt`, `stderr.txt`) holds file names
+  and per-file results, and `thumbs\` holds pictures of the user's photos. Never call the search or media API
+  in real mode: results hold file names, captions and pictures.
 - Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2;
   `stop` with a running job refuses (exit 1), and `stop -Yes` stops the job safely first.
 - Smoke test after changes:
@@ -173,9 +176,12 @@ in `web\src\pages`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode
     `stop -Fixture`;
   - after job changes, also start a fixture sort preview through the API (token and port from the fixture
     `state.json`; folder id from `GET /api/fs/roots`), wait for `ok`, then `stop -Fixture` while one runs;
+  - after search/gallery changes, run a fixture index job (`{"kind":"index","params":{"source":<dirId>}}`), then
+    `GET /api/index/stats`, `POST /api/search`, a `/media/<id>/thumb?v=<revision>` and a video `/original` with
+    a `Range` header; after `stop -Fixture` no `dashboard_sidecar` python may remain;
   - after changing `dashboard.ps1`, run it in both `pwsh` and `powershell` (5.1);
   - keep `dashboard.ps1` ASCII-only, because 5.1 reads BOM-less files as ANSI.
-- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` (44
+- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` (50
   tests, ~20 s, including `server\test\e2e.test.ts` with the real CLI and `fake_pair.py`) and `npm run build`
   (README "Tests"). Python is found through `PHOTOSORT_PYTHON`, else `photosort.cmd`. The fixture and CLI tests
   are in pytest.
@@ -187,7 +193,13 @@ in `web\src\pages`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode
   - the built web app holds no outside URLs;
   - jobs run `photosort.py` with `--events` and `--cancel-file`, detached, output to files, no shell; one heavy
     job at a time; a cancel is a request, and a forced stop is allowed only 10 s later;
-  - a stopped move job leaves exactly one journal line per moved file (e2e test).
+  - a stopped move job leaves exactly one journal line per moved file (e2e test);
+  - dashboard search scores exactly like `photosort.cmd search` (shared `score_vectors`; pytest compares them);
+  - media are reached only by HMAC ids of indexed rows, never by a path from the page; the sidecar opens the
+    index read-only, never opens cloud-only (placeholder) files, writes thumbnails without metadata, and logs
+    no query text, captions or paths (its stderr is discarded);
+  - on Windows the sidecar reads requests from a duplicate of stdin and points fd 0 at NUL: spawning the
+    thumbnail processes otherwise hangs while a read is pending on the stdin pipe.
   Never loosen the CSP, the window's request guard or the token handling.
 - Stop processes only through `dashboard.ps1 stop` (`-Force` if needed) or a job's cancel. They end only process
   ids they have verified; never stop node, electron or python by name.

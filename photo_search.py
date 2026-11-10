@@ -218,6 +218,18 @@ def from_blobs(blobs: list[bytes]) -> np.ndarray:
     return np.frombuffer(b"".join(blobs), dtype=np.float16).reshape(len(blobs), -1).astype(np.float32)
 
 
+def score_vectors(visual: np.ndarray, text: np.ndarray | None, with_text, q: np.ndarray) -> np.ndarray:
+    """Shared by the streaming CLI and the dashboard's cached vectors; never renormalize stored float16s."""
+    score = visual @ q
+    if text is not None and len(with_text):
+        score[with_text] = np.maximum(score[with_text], text @ q)
+    return score
+
+
+def ranked_indices(scores: np.ndarray, top: int) -> np.ndarray:
+    return np.argsort(-scores, kind="stable")[:top]
+
+
 def open_index(path: Path, create: bool = True) -> sqlite3.Connection:
     path = Path(path)
     if not create and not path.exists():
@@ -394,10 +406,9 @@ def search_index(cfg: dict, query: str, client, folder: Path | None = None, top:
             if not ok:
                 continue
             searched += len(ok)
-            score = from_blobs([r[2] for r in ok]) @ q
             with_text = [i for i, r in enumerate(ok) if r[3]]
-            if with_text:
-                score[with_text] = np.maximum(score[with_text], from_blobs([ok[i][3] for i in with_text]) @ q)
+            score = score_vectors(from_blobs([r[2] for r in ok]),
+                                  from_blobs([ok[i][3] for i in with_text]) if with_text else None, with_text, q)
             paths += [(r[0], r[4]) for r in ok]
             scores.append(score)
     finally:
@@ -408,7 +419,7 @@ def search_index(cfg: dict, query: str, client, folder: Path | None = None, top:
     results = []
     if scores:
         flat = np.concatenate(scores)
-        for i in np.argsort(-flat, kind="stable")[:top]:
+        for i in ranked_indices(flat, top):
             path, caption = paths[i]
             results.append({"path": path, "score": round(float(flat[i]), 3), "exists": Path(path).exists(),
                             "caption": caption})
