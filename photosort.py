@@ -12,7 +12,9 @@ import ipaddress
 import itertools
 import json
 import logging
+import os
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -154,19 +156,14 @@ class Classifier:
         raise ClassifyError(err)
 
 
-def scan(source: Path, dest: Path, buckets, recursive: bool,
-         recursive_in_place: bool = False) -> tuple[list[Path], int]:
-    """Return images and skipped non-image count; ignore bucket folders at the relevant depth."""
+def scan(source: Path, dest: Path, buckets, recursive: bool) -> tuple[list[Path], int]:
+    """Return (images to sort, count of skipped non-image files). Files already in bucket folders are ignored."""
     bucket_dirs = {(dest / b).resolve() for b in buckets}
-    bucket_names = {str(b).casefold() for b in buckets}
     images, skipped = [], 0
     for p in sorted(source.rglob("*") if recursive else source.iterdir()):
         if not p.is_file() or p.name == JOURNAL_NAME:
             continue
         if bucket_dirs.intersection(p.resolve().parents):
-            continue
-        if recursive_in_place and any(part.casefold() in bucket_names
-                                       for part in p.relative_to(source).parts[:-1]):
             continue
         if p.suffix.lower() in IMAGE_EXTS:
             images.append(p)
@@ -185,12 +182,9 @@ def unique_path(target: Path) -> Path:
 
 
 def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str = "move",
-                recursive: bool = False, limit: int = 0, classifier=None,
-                recursive_in_place: bool = False) -> dict:
+                recursive: bool = False, limit: int = 0, classifier=None) -> dict:
     started, t_start = datetime.now(), time.perf_counter()
     source = Path(source).resolve()
-    if recursive_in_place and dest is not None:
-        raise ValueError("--recursive-in-place cannot be combined with --dest")
     dest = Path(dest).resolve() if dest else source
     if not source.is_dir():
         raise FileNotFoundError(f"source folder not found: {source}")
@@ -198,7 +192,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
     if clf is None:
         clf = Classifier(cfg)
         clf.preflight()
-    images, skipped = scan(source, dest, cfg["buckets"], recursive or recursive_in_place, recursive_in_place)
+    images, skipped = scan(source, dest, cfg["buckets"], recursive)
     images = images[: limit or None]
     run_id = started.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     journal = dest / JOURNAL_NAME
@@ -218,8 +212,7 @@ def sort_folder(cfg: dict, source: Path, dest: Path | None = None, action: str =
                     bucket, conf = fut.result()
                     entry.update(bucket=bucket, confidence=round(conf, 3))
                     if action in ("move", "copy"):
-                        target_dir = src.parent if recursive_in_place else dest
-                        target = unique_path(target_dir / bucket / src.name)
+                        target = unique_path(dest / bucket / src.name)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         (shutil.move if action == "move" else shutil.copy2)(str(src), str(target))
                         entry["dst"] = str(target)
@@ -280,6 +273,21 @@ def format_report(s: dict) -> str:
     return "\n".join(lines)
 
 
+def remove_empty_folder(folder: Path) -> None:
+    """Delete a bucket folder once it is empty. OneDrive can mark synced folders read-only,
+    which makes rmdir fail with 'Access is denied' on Windows, so clear that flag first."""
+    try:
+        if any(folder.iterdir()):
+            return
+        try:
+            folder.rmdir()
+        except PermissionError:
+            os.chmod(folder, stat.S_IWRITE)
+            folder.rmdir()
+    except OSError:
+        pass
+
+
 def undo(journal: Path, run_id: str | None = None) -> dict:
     """Move files from a sort run back to where they came from (default: latest run not yet undone)."""
     journal = Path(journal)
@@ -301,10 +309,7 @@ def undo(journal: Path, run_id: str | None = None) -> dict:
         src.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(dst), str(src))
         restored += 1
-        try:
-            dst.parent.rmdir()  # drop bucket folder once empty
-        except OSError:
-            pass
+        remove_empty_folder(dst.parent)
     with journal.open("a", encoding="utf-8") as jf:
         jf.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "run_id": run_id,
                              "action": "undo", "restored": restored, "problems": problems}) + "\n")
@@ -322,9 +327,9 @@ def main(argv=None) -> int:
     s.add_argument("source", type=Path)
     s.add_argument("--dest", type=Path, help="where bucket folders are created (default: source)")
     s.add_argument("--action", choices=["move", "copy", "report"], help="default from config")
-    s.add_argument("--recursive", action="store_true", help="include subfolders (bucket folders are skipped)")
-    s.add_argument("--recursive-in-place", action="store_true",
-                   help="sort each folder into its own bucket folders; skip bucket folders at any depth")
+    s.add_argument("--recursive", action="store_true",
+                   help="include subfolders; all their images go into the top-level buckets "
+                        "(bucket folders there are skipped)")
     s.add_argument("--limit", type=int, default=0, help="only process the first N images")
     s.add_argument("--concurrency", type=int, help="parallel requests to the PAIR cluster")
     s.add_argument("--model", help="override the configured model")
@@ -378,8 +383,7 @@ def main(argv=None) -> int:
             cfg["model"] = a.model
         if a.concurrency:
             cfg["concurrency"] = a.concurrency
-        summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit,
-                              recursive_in_place=a.recursive_in_place)
+        summary = sort_folder(cfg, a.source, a.dest, a.action or cfg["action"], a.recursive, a.limit)
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(errors="replace")  # odd characters in a path must not crash the report
         print(format_report(summary), flush=True)

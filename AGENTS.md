@@ -28,9 +28,10 @@ as any feature, config or procedure change.
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" # revert the latest run
 ```
 
-For a directory tree, use `sort "<root>" --recursive-in-place`: bucket each directory's own images
-beside it, preserve the tree, and skip existing bucket folders at any depth. Do not combine with `--dest`.
-Plain `--recursive` still puts all results under one shared destination. Sort moves files without changing
+When the user asks to sort a folder "with subfolders", run `sort "<root>" --recursive`: every image from
+every subfolder goes into one flat set of bucket folders at the root. That is what the user wants; never
+create buckets inside each subfolder. Bucket folders left inside subfolders by older per-month sorts are
+pulled into the root buckets too, and videos stay in their subfolders. Sort moves files without changing
 image bytes or re-encoding them.
 
 Report to the user: images sorted, errors, duration, images/min, per-bucket counts (all in the finish report).
