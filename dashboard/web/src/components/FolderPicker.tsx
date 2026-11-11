@@ -1,6 +1,6 @@
 // Choosing a folder: browse from the roots (or recent job folders), or paste a path once. The server answers
 // with opaque folder ids; the page never sends a raw path to a job.
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState } from 'react';
 import { api, errorText, type DirInfo, type DirListing } from '../api.ts';
 import { Icon } from '../icons.tsx';
 
@@ -39,11 +39,12 @@ export function FolderPicker({ label, value, onChange, optional, recent = [], hi
     if (value && !listing) void browse(value.dirId);
   }, [open]); // only when the panel opens
 
-  const paste = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!pasted.trim()) return;
+  const paste = async () => {
+    if (busy || !pasted.trim()) return;
     setBusy(true);
     setError(undefined);
+    setProblem(undefined);
+    setListing(undefined);
     try {
       const r = await api<DirInfo & { problem?: string }>('/api/fs/resolve', { method: 'POST', body: { path: pasted } });
       setListing(await api<DirListing>(`/api/fs/dirs?dir=${encodeURIComponent(r.dirId)}`));
@@ -112,12 +113,23 @@ export function FolderPicker({ label, value, onChange, optional, recent = [], hi
               {listing.truncated && <p className="muted small">Only the first 2000 subfolders are shown.</p>}
             </>
           )}
-          <form className="picker-paste" onSubmit={(e) => void paste(e)}>
+          <div className="picker-paste">
             <input type="text" value={pasted} onChange={(e) => setPasted(e.target.value)} placeholder="…or paste a folder path, like C:\Users\you\Pictures"
-              aria-label="Folder path" spellCheck={false} />
-            <button type="submit" className="ghost" disabled={busy || !pasted.trim()}>Go</button>
-          </form>
-          {error && <p className="bad small">{error}</p>}
+              aria-label="Folder path" spellCheck={false} onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void paste();
+                }
+              }} />
+            <button type="button" className="ghost" disabled={busy || !pasted.trim()} onClick={() => void paste()}>
+              {busy ? 'Opening…' : 'Go'}
+            </button>
+          </div>
+          <p className="muted small" role="status">
+            {busy ? 'Opening folder…' : listing ? 'Choose Use this folder to select it.' : 'Go opens a folder without starting a job.'}
+          </p>
+          {error && <p className="bad small" role="alert">{error}</p>}
         </div>
       )}
     </div>

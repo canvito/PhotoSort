@@ -171,7 +171,15 @@ export async function api<T>(path: string, init?: { method?: 'POST' | 'DELETE'; 
     cache: 'no-store',
   });
   if (r.status === 401) throw new ApiError(401, 'Open the dashboard with dashboard.ps1: its window adds the access token.');
-  const data = await r.json().catch(() => ({}));
+  let data: unknown;
+  try {
+    data = await r.json();
+  } catch (e) {
+    // An abort while the body is read stays an abort; it must never turn into an empty reply that callers use.
+    if (init?.signal?.aborted) throw e;
+    if (r.ok) throw new ApiError(r.status, 'The dashboard server sent an unreadable reply. Try again.');
+    data = {};
+  }
   if (!r.ok) throw new ApiError(r.status, (data as { error?: string }).error ?? `HTTP ${r.status}`);
   return data as T;
 }
@@ -191,7 +199,9 @@ export function usePoll<T>(path: string, everyMs = 0): Loaded<T> {
     const ctrl = new AbortController();
     setState((s) => ({ ...s, loading: true }));
     api<T>(path, { signal: ctrl.signal })
-      .then((data) => setState({ data, loading: false }))
+      .then((data) => {
+        if (!ctrl.signal.aborted) setState({ data, loading: false });
+      })
       .catch((e: unknown) => {
         if (!ctrl.signal.aborted) setState((s) => ({ data: s.data, error: e instanceof Error ? e.message : String(e), loading: false }));
       });

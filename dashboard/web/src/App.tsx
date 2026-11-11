@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, Route, Switch, useLocation } from 'wouter';
 import { useServerEvents, usePoll, useShellInfo, type Meta, type PairHealth, type PythonInfo, type ShellInfo } from './api.ts';
 import { JobDock } from './components/JobDock.tsx';
+import { PageErrorBoundary } from './components/ui.tsx';
 import { Icon } from './icons.tsx';
 import { JobsContext, useJobListSource } from './jobs.ts';
 import { GroupPage } from './pages/Group.tsx';
@@ -127,6 +128,7 @@ export function App() {
         {!window.photosort && <div className="banner warn">Opened outside the PhotoSort window: the network guard and content protection are off. Use dashboard.ps1 open.</div>}
         {stopped && <div className="banner bad">The dashboard server stopped. Start it again with dashboard.ps1.</div>}
         <main className="content">
+          <PageErrorBoundary key={location}>
           <Switch>
             <Route path="/"><Overview ctx={ctx} reloadHealth={health.reload} /></Route>
             <Route path="/privacy"><Privacy ctx={ctx} /></Route>
@@ -140,6 +142,7 @@ export function App() {
             <Route path="/settings"><Placeholder page="settings" /></Route>
             <Route><div className="card"><h2>Not found</h2><p>This page does not exist. <Link href="/">Back to Overview</Link></p></div></Route>
           </Switch>
+          </PageErrorBoundary>
         </main>
         <JobDock />
       </div>

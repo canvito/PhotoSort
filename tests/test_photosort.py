@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -24,8 +25,10 @@ import photo_search  # noqa: E402
 import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
 import group  # noqa: E402
+import index_transfer  # noqa: E402
 import media  # noqa: E402
 import runctl  # noqa: E402
+from local_only import LocalOnlyError  # noqa: E402
 
 BUCKETS = {"people": "", "food": "", "screenshot_chat": "", "other": ""}
 CFG = {"model": "fake", "concurrency": 4, "buckets": BUCKETS}
@@ -505,6 +508,76 @@ def test_case_only_rename_leaves_one_index_entry(tmp_path):
 
     assert (s["reused"], s["removed"], s["total_indexed"]) == (1, 1, 1)
     assert [Path(x["path"]).name for x in photo_search.search_index(CFG, "cat", client)["results"]] == ["CAT.jpg"]
+
+
+def pc_config(tmp_path, name):
+    return {**CFG, "index_path": str(tmp_path / name / "search_index.sqlite")}
+
+
+def test_index_moves_to_another_pc_without_reading_or_describing_its_files_again(tmp_path, capsys):
+    pc_a, pc_b = pc_config(tmp_path, "pc_a"), pc_config(tmp_path, "pc_b")
+    home_a, home_b = tmp_path / "a" / "Users" / "bob", tmp_path / "b" / "Users" / "carol"
+    pics_a, pics_b = home_a / "Pictures", home_b / "Pictures"
+    pics_a.mkdir(parents=True)
+    pics_b.mkdir(parents=True)
+    make_photos(pics_a, ["cat.jpg", "beach.jpg", "receipt.png", "lunch.jpg"])
+    photo_search.index_folder(pc_a, pics_a, FakeSearchClient(), photosort.IMAGE_EXTS)
+    export = tmp_path / "usb" / "index.sqlite"
+    export.parent.mkdir()
+    assert index_transfer.export_index(pc_a, export)["files"] == 4
+
+    for name in ["cat.jpg", "beach.jpg", "receipt.png"]:  # lunch.jpg is not on this PC
+        shutil.copy2(pics_a / name, pics_b / name)
+    st = (pics_b / "cat.jpg").stat()
+    os.utime(pics_b / "cat.jpg", ns=(st.st_atime_ns, st.st_mtime_ns // 10**9 * 10**9))  # synced in whole seconds
+    (pics_b / "receipt.png").write_bytes(b"edited on this PC")
+    maps = [(str(home_a).upper(), str(home_b))]
+
+    dry = index_transfer.import_index(pc_b, export, maps, dry_run=True)
+    assert (dry["ready"], dry["changed"], dry["missing"], dry["total_indexed"]) == (2, 1, 1, 3)
+    assert not Path(pc_b["index_path"]).exists()
+
+    config = cli_config(tmp_path, index_path=pc_b["index_path"])
+    assert photosort.main(["--config", str(config), "index-import", str(export), "--map", *maps[0]]) == 0
+    out = capsys.readouterr().out
+    assert "Ready to search here" in out and "cat.jpg" not in out and "SAFEWAY" not in out
+
+    client = FakeSearchClient()
+    s = photo_search.index_folder(pc_b, pics_b, client, photosort.IMAGE_EXTS)
+    assert (s["unchanged"], s["captioned"], s["total_indexed"]) == (2, 1, 3) and client.captioned == ["receipt.png"]
+    hit = photo_search.search_index(pc_b, "kids at the beach", client, top=1)["results"][0]
+    assert hit["path"] == str(pics_b.resolve() / "beach.jpg")
+
+    again = index_transfer.import_index(pc_b, export, maps)
+    assert (again["kept"], again["ready"], again["changed"], again["missing"]) == (3, 0, 0, 1)
+    assert Path(again["backup"]).is_file()
+
+
+def test_index_export_stays_out_of_onedrive_and_import_checks_its_inputs(tmp_path, monkeypatch):
+    pc = pc_config(tmp_path, "pc")
+    pics = tmp_path / "pics"
+    pics.mkdir()
+    make_photos(pics, ["cat.jpg"])
+    photo_search.index_folder(pc, pics, FakeSearchClient(), photosort.IMAGE_EXTS)
+    onedrive = tmp_path / "OneDrive"
+    onedrive.mkdir()
+    monkeypatch.setenv("OneDrive", str(onedrive))
+
+    with pytest.raises(LocalOnlyError):
+        index_transfer.export_index(pc, onedrive / "index.sqlite")
+    assert not any(onedrive.iterdir())
+    assert index_transfer.export_index(pc, onedrive / "index.sqlite", allow_onedrive=True)["files"] == 1
+    with pytest.raises(ValueError, match="already exists"):
+        index_transfer.export_index(pc, onedrive / "index.sqlite", allow_onedrive=True)
+
+    not_index = tmp_path / "notes.sqlite"
+    not_index.write_text("not a database")
+    with pytest.raises(photo_search.SearchError):
+        index_transfer.import_index(pc, not_index)
+    with pytest.raises(FileNotFoundError, match="not found on this PC"):
+        index_transfer.import_index(pc, onedrive / "index.sqlite", [("C:\\Users\\bob", str(tmp_path / "nope"))])
+    with pytest.raises(ValueError, match="own index"):
+        index_transfer.import_index(pc, Path(pc["index_path"]))
 
 
 COLORS = {"red": (255, 0, 0), "blue": (0, 0, 255), "green": (0, 128, 0), "yellow": (255, 255, 0),

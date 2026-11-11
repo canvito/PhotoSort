@@ -16,18 +16,12 @@ from pathlib import Path
 
 import numpy as np
 
-from local_only import LocalOnlyError
+from local_only import LocalOnlyError, under_onedrive
 from photo_search import (PairSearchClient, SearchError, _folder_key, _is_under, from_blobs, index_path,
                           ranked_indices, score_vectors, settings)
 from photosort import IMAGE_EXTS, encode_image, load_config
 from media import VIDEO_EXTS, is_video
 from thumbs import MediaUnavailable, ThumbCache, is_placeholder, media_stat, revision
-
-
-def under_onedrive(path: Path) -> bool:
-    roots = [Path.home() / "OneDrive"]
-    roots += [Path(os.environ[k]) for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial") if os.environ.get(k)]
-    return any(path.resolve().is_relative_to(r.resolve()) for r in roots)
 
 
 class Library:

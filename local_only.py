@@ -6,12 +6,21 @@ faces) go only to the NVIDIA PAIR proxy on this PC, and only to models running o
 from __future__ import annotations
 
 import ipaddress
+import os
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
 
 class LocalOnlyError(RuntimeError):
     pass
+
+
+def under_onedrive(path: Path) -> bool:
+    """True when `path` is inside a OneDrive folder, whose contents OneDrive uploads to the cloud."""
+    roots = [Path.home() / "OneDrive"]
+    roots += [Path(os.environ[k]) for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial") if os.environ.get(k)]
+    return any(Path(path).resolve().is_relative_to(r.resolve()) for r in roots)
 
 
 def require_loopback(url: str) -> None:

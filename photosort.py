@@ -27,6 +27,7 @@ from PIL import Image, ImageOps
 import group
 import runctl
 from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
+from index_transfer import export_index, format_export_report, format_import_report, import_index
 from local_only import LocalOnlyError, require_local_models, require_loopback
 from media import VIDEO_EXTS, VideoError, encode_pil, is_video, video_jpegs
 from photo_search import (PairSearchClient, SearchError, index_folder, index_path, search_index, settings,
@@ -934,6 +935,18 @@ def _run(a: argparse.Namespace) -> tuple[int, dict | None, str | None]:
         print(report, flush=True)
         return (1 if result["summary"]["errors"] else 0), result["summary"], report
     cfg = load_config(a.config)
+    if a.cmd in ("index-export", "index-import"):
+        if a.cmd == "index-export":
+            result = export_index(cfg, a.out, a.allow_onedrive)
+            report = format_export_report(result)
+            code = 0
+        else:
+            result = import_index(cfg, a.file, a.map, a.dry_run)
+            report = format_import_report(result)
+            # Nothing found here at all almost always means a missing or wrong --map.
+            code = 1 if result["files"] and result["missing"] == result["files"] else 0
+        print(report, flush=True)
+        return code, result, report
     if a.cmd == "check":
         clf = Classifier(cfg)
         names = clf.preflight()
@@ -1070,6 +1083,18 @@ def main(argv=None) -> int:
     q.add_argument("--folder", type=Path, help="only return files under this folder")
     q.add_argument("--top", type=int, default=10, help="number of results (default 10)")
     q.add_argument("--paths-only", action="store_true", help="print only file paths, no captions")
+    e = sub.add_parser("index-export",
+                       help="copy the search index into one file to bring to another PC (no model calls)")
+    e.add_argument("out", type=Path, help="new file to write, e.g. on a USB drive: E:\\photosort-index.sqlite")
+    e.add_argument("--allow-onedrive", action="store_true",
+                   help="allow writing into OneDrive, which uploads your photos' captions and visible text")
+    m = sub.add_parser("index-import",
+                       help="merge an index exported on another PC, so `index` does not describe those files again")
+    m.add_argument("file", type=Path, help="file written by index-export")
+    m.add_argument("--map", nargs=2, action="append", default=[], metavar=("OLD", "NEW"),
+                   help="files under the other PC's folder OLD are under NEW here, e.g. "
+                        "--map C:\\Users\\bob C:\\Users\\<you> (repeat for more folders)")
+    m.add_argument("--dry-run", action="store_true", help="only report what would be imported; change nothing")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")

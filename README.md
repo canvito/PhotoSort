@@ -15,7 +15,8 @@ non-loopback `base_url`, ignores system/env HTTP proxies, and refuses Ollama clo
 `--model` names one and at preflight before any photo is sent. OneDrive is the one cloud service involved, and
 only as storage: the photos already live there, so OneDrive syncs what PhotoSort does inside a synced folder,
 namely the bucket and group folders, the moved files, `_photosort_journal.jsonl` (file paths, bucket and
-confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive.
+confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive
+(and `index-export` refuses to write a copy into OneDrive unless you add `--allow-onedrive`).
 See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
 The [Dashboard](#dashboard-dashboardps1), a desktop window, runs sort, group, index, apply and undo for you, with
@@ -262,10 +263,51 @@ modified.
 **Index location:** by default, the SQLite database is
 `%LOCALAPPDATA%\PhotoSort\search_index.sqlite` (for example,
 `C:\Users\<you>\AppData\Local\PhotoSort\search_index.sqlite`). It is generated locally on each PC;
-it is not in the PhotoSort repository or OneDrive, and is not shared with another PC. The database
+it is not in the PhotoSort repository or OneDrive. To reuse it on another PC, copy it with `index-export` and
+`index-import` (below). The database
 contains captions and visible text derived from your photos. `index_path` in `config.json` can change
 its location; keep it on a local, non-synced drive. Deleting the database is safe—run `index` again
 to rebuild it. Your photos are not affected.
+
+### Use the index on another PC
+
+Captioning is the slow part, so a second PC can take over the first PC's index instead of describing every file
+again. Copy it, don't share it: two PCs must never use one live index file.
+
+```powershell
+# On the PC that has the index: write a snapshot (safe while the dashboard or an index run uses the index)
+.\photosort.cmd index-export "E:\photosort-index.sqlite"
+
+# On the other PC: check first, then import. --map says where the first PC's folders are on this PC.
+.\photosort.cmd index-import "E:\photosort-index.sqlite" --map "C:\Users\bob" "C:\Users\<you>" --dry-run
+.\photosort.cmd index-import "E:\photosort-index.sqlite" --map "C:\Users\bob" "C:\Users\<you>"
+
+# Then index as usual: files the import matched are skipped; only new or changed files are read or described
+.\photosort.cmd index "C:\Users\<you>\OneDrive\Pictures\Camera Roll"
+```
+
+- **Nothing goes over the network.** Rows are copied file to file; no model or PAIR call. The export report
+  shows the number of files and the top folders in the index (to help you write `--map`), never file names.
+- **Not into OneDrive.** The file holds your photos' captions and visible text, so `index-export` refuses a
+  OneDrive folder (OneDrive would upload it) unless you add `--allow-onedrive`. Use a USB drive or another local
+  folder, and delete the file after importing.
+- **`--map OLD NEW`** (repeatable): a file under the other PC's folder `OLD` is looked for under `NEW` here
+  (case-insensitive; the longest matching `OLD` wins). Paths that match no `--map` are looked for as they are.
+  Without the right `--map`, nothing is found: the report warns, lists the folders the export's paths start
+  with, and exits with code 1.
+- **Only files found on this PC are imported.** Files with the same size and modified time (within 2 s) are
+  ready at once: the next `index` skips them without reading them, so OneDrive online-only files stay online
+  only. Files that changed are imported too; `index` reads them again and keeps the caption if the content is
+  the same. Finding files reads folder listings and file sizes and times only.
+- **This PC's own entries win.** A file this PC has already indexed keeps its entry, unless that entry is out of
+  date and the imported one matches the file. Importing twice is harmless.
+- **Undo:** before writing, the import saves the previous index as `search_index.before-import.sqlite` next to
+  it (replaced by the next import). To undo, stop the dashboard and copy it over `search_index.sqlite`.
+  `--dry-run` writes nothing.
+- Entries made with other `caption_model`/`embed_model` settings are imported and counted; the next `index`
+  describes those files again with this PC's models.
+- Export the index again after a `sort`, `group` or `undo` on the first PC: moved files are found by their new
+  path only in a newer export.
 
 Behavior:
 - **Speed:** indexing is the slow part (one caption per photo), so it runs in parallel across the PAIR
@@ -286,8 +328,8 @@ Behavior:
   and reuse their entry without a model call. Entries for files no longer under the folder are removed.
   `sort` and `undo` update the index for the files they move, so results keep pointing at the right place.
 - The index is a SQLite file at `%LOCALAPPDATA%\PhotoSort\search_index.sqlite` (`index_path`), outside
-  the repo and OneDrive. It is local to this PC and contains descriptions of private photos. Delete it
-  to start over; no photo files are deleted or changed.
+  the repo and OneDrive. It is local to this PC (copy it to another with `index-export`/`index-import`) and
+  contains descriptions of private photos. Delete it to start over; no photo files are deleted or changed.
 - The index finish report shows files found (and how many are videos), captioned, reused, unchanged,
   removed, errors, **duration** and files/min. It never prints captions. Exit code 1 if some files failed;
   re-run `index` to retry them.
@@ -479,6 +521,11 @@ it. Folders come from a picker (Pictures, Videos, OneDrive Pictures, Desktop, Do
 pasted path. It refuses whole drives, your whole user folder, system and app-data folders, network paths and
 PhotoSort's own folders.
 
+**To select a pasted path:** click **Choose…**, paste the path, press **Go** (or Enter), then click
+**Use this folder**. Go opens the folder; it does not start sorting. The picker shows **Opening folder…**
+while it loads and an error below the path if the folder cannot be opened. After selecting the folder, click
+**Preview** to check the proposed buckets without moving anything.
+
 | Page | What it does |
 |---|---|
 | **Sort** | Preview, move or copy into buckets; optional destination, subfolders, and advanced limit, parallel requests, model and `--force` |
@@ -603,6 +650,8 @@ How it works:
 - "The server did not start": read `logs\server-crash.log` or `logs\server-<date>.log` in the data folder.
 - The window doesn't open or stays blank: check `.\dashboard.ps1 status`, then `logs\shell-<date>.log` (window
   events only).
+- A page shows "This page hit a problem": press **Try again**, or switch tabs (the menu keeps working). If it
+  comes back, press **Reload window**.
 - Port in use: it takes the next free port; or pass `-Port`.
 - The window runs on the wrong GPU: pass `-Gpu rtx` or `-Gpu igpu`, or check Windows' graphics settings for
   `electron.exe`.
@@ -711,6 +760,10 @@ server connects only to PAIR on `127.0.0.1`, and its window only to that server.
 refuse cloud models (the server refuses a cloud model name before starting a job, too).
 `.\dashboard.ps1 selftest -Fixture` rechecks the window's guard.
 
+**Since the audit, `index-export` and `index-import`** copy the index between your PCs as a file, with no network
+or model call. `index-export` refuses OneDrive folders unless you add `--allow-onedrive`, and its file holds your
+photos' captions and visible text, so keep it on a USB drive or a local folder and delete it after importing.
+
 To recheck PAIR routing at any time, count requests by target. Every target should be a `192.168.x.x` node,
 `cluster` (PAIR's own model list) or blank (a request that was never routed):
 
@@ -728,6 +781,8 @@ Get-Content "$env:LOCALAPPDATA\NVIDIA Corporation\Personal AI Router\logs\nvpair
   are left in place. A video that can't be decoded is reported as an error and left in place.
 - This PC's GPU is busy again during a run: its Ollama engine was turned back on in PAIR. Turn it off there.
 - `search` says "no search index": run `index` on a folder first.
+- `index-import` says files were not found here: add `--map OLD NEW` for the folders the warning lists (`OLD` as
+  on the other PC, `NEW` as on this one), and check with `--dry-run` until "Ready to search here" is high.
 - `group` says "the request was read in different ways": the 3 readings disagreed. Reword it (say the day, e.g.
   "on Sunday 11/8"), or give `--from`/`--to` and `--media`. "the request could mean … or …": add the `--media`
   it suggests. "cannot pick out specific people": describe what the photos show instead of who is in them.
@@ -758,7 +813,7 @@ Dashboard (after `.\dashboard.ps1 setup -Fixture -Yes`), with its private Node.j
 ```powershell
 cd dashboard
 $env:PATH = (Get-ChildItem "$env:LOCALAPPDATA\PhotoSort\runtime\node-v*-win-x64" | Select-Object -Last 1).FullName + ";$env:PATH"
-npm run typecheck; npm test; npm run build   # 50 tests, ~20 s; the build also scans the bundle for outside URLs
+npm run typecheck; npm test; npm run build   # includes fixture-window checks; no personal media is used
 cd ..
 .\dashboard.ps1 start -Fixture -NoOpen; .\dashboard.ps1 selftest -Fixture; .\dashboard.ps1 stop -Fixture
 ```
@@ -775,3 +830,11 @@ fixture mode. `server\test\gallery.test.ts` builds a synthetic indexed library
 refresh and that forged ids and paths are refused; `tests\test_dashboard_sidecar.py` checks that cached search
 equals the CLI's, metadata stripping, the cache limit and that cloud-only files are never opened. For the 31,000
 item measurement: `make_search_fixture.py --out <new folder in %TEMP%> --count 31000`.
+
+`server\test\fixture-window.test.ts` builds the current UI into a temporary folder and opens an isolated
+fixture-mode Electron window with empty synthetic folders. It checks Go/Enter, quoted paths, loading/error
+feedback and changing folders without accidentally submitting the Sort form. It also checks, with mocked index
+replies, that the Search page stays on screen when an index refresh cancels a reply that is still arriving
+(this used to blank the window right after indexing), and that a page that fails to draw shows "This page hit a
+problem" with Try again / Reload window while the navigation keeps working. The test never attaches to the
+user's window and removes its temporary files when it finishes.

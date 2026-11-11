@@ -24,7 +24,7 @@ as any feature, config or procedure change.
   read the index file (`%LOCALAPPDATA%\PhotoSort\search_index.sqlite`) or print captions. The user can run
   `search` without `--paths-only` to see captions. The index is a local, per-PC file outside the repo at
   `%LOCALAPPDATA%\PhotoSort\search_index.sqlite`; keep it out of OneDrive and git. It can be rebuilt by
-  running `index` again.
+  running `index` again, or brought from another PC with `index-export`/`index-import` (see Search below).
 - **File names and per-file results never reach you.** On the user's folders, `sort`, `group`, `index`,
   `faces`, `apply` and `undo` log one line per file (name plus bucket, MATCH/no or error) to stderr, and the finish
   report goes to stdout (counts only). Send stderr to a local log outside OneDrive and the repo, and show only
@@ -117,6 +117,8 @@ finish report).
 ```powershell
 .\photosort.cmd index "<folder>"                          # caption + embed, always recursive; finish report with duration
 .\photosort.cmd search "<query>" --paths-only             # optional: --folder "<folder>" --top 20
+.\photosort.cmd index-export "E:\photosort-index.sqlite"  # copy the index to bring to another PC
+.\photosort.cmd index-import "E:\photosort-index.sqlite" --map "<old folder>" "<folder here>" --dry-run
 ```
 
 - `index` is the slow, parallel part: 12 caption requests in flight across the PAIR nodes (`index_concurrency`,
@@ -130,6 +132,15 @@ finish report).
 - Search is a single local embedding call (~0.05 s); it needs no cluster parallelism.
 - Report from the index finish report: files found (videos), captioned, reused, unchanged, removed, errors,
   duration, files/min. For a search, give the user the paths (or the command to run themselves).
+- Another PC (`index_transfer.py`): `index-export <new file>` writes a consistent snapshot (SQLite backup API);
+  `index-import <file> [--map OLD NEW]... [--dry-run]` merges it in one transaction, after saving the old index
+  as `search_index.before-import.sqlite`. No model, PAIR or network call. Import keeps only files that exist
+  here, and gives a file with the same size and modified time (±2 s) this PC's `mtime_ns`, so the next `index`
+  skips it without reading it (reading hydrates OneDrive online-only files). An entry this PC already has is
+  kept unless it is out of date and the imported one matches the file. Invariants: export refuses OneDrive
+  (`local_only.under_onedrive`) without `--allow-onedrive`; reports print counts and top folders (drive + 3
+  levels), never file names or captions; exit 1 when no file was found (a wrong or missing `--map`).
+  The export file holds captions: never read or open it, as with the index.
 
 ## Tag faces (InsightFace buffalo_l, reference-photo matching, no training)
 
@@ -181,15 +192,21 @@ Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify
     a `Range` header; after `stop -Fixture` no `dashboard_sidecar` python may remain;
   - after changing `dashboard.ps1`, run it in both `pwsh` and `powershell` (5.1);
   - keep `dashboard.ps1` ASCII-only, because 5.1 reads BOM-less files as ANSI.
-- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test` (50
-  tests, ~20 s, including `server\test\e2e.test.ts` with the real CLI and `fake_pair.py`) and `npm run build`
+- Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test`
+  (including `server\test\e2e.test.ts` with the real CLI and `fake_pair.py`) and `npm run build`
   (README "Tests"). Python is found through `PHOTOSORT_PYTHON`, else `photosort.cmd`. The fixture and CLI tests
-  are in pytest.
+  are in pytest. `server\test\fixture-window.test.ts` builds the current UI and uses a separate fixture Electron
+  window with empty synthetic folders and mocked index replies; it never attaches to the user's window.
 - Invariants, all tested:
   - only `server\src\localfetch.ts` opens connections: loopback, read-only PAIR paths, cloud models refused;
   - every route declares an auth class;
   - request bodies with unknown fields are refused (ajv `removeAdditional:false`); each job kind has a strict
     parameter schema, folders travel as ids from the picker, and a cloud model name is refused;
+  - the folder picker lives inside job forms: its pasted-path row must not be a nested form. Go is a
+    non-submit button, and Enter is handled locally; neither may submit the surrounding job form;
+  - `api()` in `web\src\api.ts` never turns a cancelled or unreadable 2xx reply into data (it rethrows the
+    abort, or raises `ApiError`), and `usePoll` ignores replies to cancelled requests; pages render inside
+    `PageErrorBoundary`, so a page that fails to draw shows a message instead of blanking the window;
   - the built web app holds no outside URLs;
   - jobs run `photosort.py` with `--events` and `--cancel-file`, detached, output to files, no shell; one heavy
     job at a time; a cancel is a request, and a forced stop is allowed only 10 s later;

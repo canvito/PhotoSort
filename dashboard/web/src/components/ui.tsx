@@ -1,8 +1,32 @@
-// Small shared pieces: rows, status badges, progress bars, count bars, copy buttons and the CLI box.
-import { useState, type ReactNode } from 'react';
+// Small shared pieces: rows, status badges, progress bars, count bars, copy buttons, the CLI box and the page
+// error boundary.
+import { Component, useState, type ReactNode } from 'react';
 import type { JobStatus } from '../api.ts';
 import { Icon } from '../icons.tsx';
 import { STATUS } from '../jobs.ts';
+
+/** Keeps the window usable when one page throws while rendering: the navigation stays and the page can retry. */
+export class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  render(): ReactNode {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <section className="card" role="alert">
+        <h2>This page hit a problem</h2>
+        <p className="muted">Nothing was changed. Try the page again; if it keeps happening, reload the window.</p>
+        <div className="actions">
+          <button type="button" className="primary" onClick={() => this.setState({ failed: false })}>Try again</button>
+          <button type="button" className="ghost" onClick={() => window.location.reload()}>Reload window</button>
+        </div>
+      </section>
+    );
+  }
+}
 
 export function Row({ k, v, tone }: { k: ReactNode; v: ReactNode; tone?: 'ok' | 'warn' | 'bad' }) {
   return (
