@@ -163,13 +163,15 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
-## Dashboard (`dashboard.ps1`, v1: phases P0–P2)
+## Dashboard (`dashboard.ps1`, phases P0–P3 done; P4 faces and settings next)
 
 Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify; jobs in `jobs.ts`, routes in
 `routes.ts`, folder picker in `dirs.ts`, search/gallery routes in `gallery.ts`, its Python helper in
-`sidecar.ts`), `dashboard_sidecar.py` and `thumbs.py` (cached search, index browsing, metadata-free thumbnails),
-`dashboard\shell` (Electron window), `dashboard\web` (React SPA; pages in `web\src\pages`, grid in
-`components\Gallery.tsx`), `dashboard\fixtures` and `tests\fake_pair.py` (fixture mode).
+`sidecar.ts`, runs history in `runs.ts`, PAIR log reader in `pairlog.ts` with its routes in `cluster.ts`,
+privacy checks and the connection list in `privacy.ts`), `dashboard_sidecar.py` and `thumbs.py` (cached search,
+index browsing, metadata-free thumbnails, journal reading), `dashboard\shell` (Electron window),
+`dashboard\web` (React SPA; pages in `web\src\pages`, grid in `components\Gallery.tsx`), `dashboard\fixtures`
+and `tests\fake_pair.py` (fixture mode; with `--pair-dir` it also writes a synthetic PAIR log and member list).
 
 - **Agents use fixture mode only:** `.\dashboard.ps1 <command> -Fixture -Yes`. Fixture mode has a synthetic
   library, a fake PAIR on `127.0.0.1:47617` (the server starts it and it exits with the server), its own data
@@ -179,11 +181,14 @@ Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify
   paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard`: its `state.json` holds the token, the logs and window
   cache are the user's, `jobs\<id>\` (`job.json`, `events.jsonl`, `stdout.txt`, `stderr.txt`) holds file names
   and per-file results, and `thumbs\` holds pictures of the user's photos. Never call the search or media API
-  in real mode: results hold file names, captions and pictures.
+  in real mode: results hold file names, captions and pictures. The same goes for `/api/runs` (file names) and
+  `folders.json`. Never read the real PAIR log beyond its structure (counts, field names); the Cluster page and
+  `/api/pair/*` are fixture-only for agents.
 - Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2;
   `stop` with a running job refuses (exit 1), and `stop -Yes` stops the job safely first.
 - Smoke test after changes:
-  - `setup -Fixture -Yes`, `start -Fixture -NoOpen`, `status -Fixture`, `selftest -Fixture` (8 PASS),
+  - `setup -Fixture -Yes`, `start -Fixture -NoOpen`, `status -Fixture`, `selftest -Fixture` (9 PASS; it also
+    draws every page and a run's page and fails on the error boundary, an empty page or a console error),
     `stop -Fixture`;
   - after job changes, also start a fixture sort preview through the API (token and port from the fixture
     `state.json`; folder id from `GET /api/fs/roots`), wait for `ok`, then `stop -Fixture` while one runs;
@@ -216,7 +221,10 @@ Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify
     index read-only, never opens cloud-only (placeholder) files, writes thumbnails without metadata, and logs
     no query text, captions or paths (its stderr is discarded);
   - on Windows the sidecar reads requests from a duplicate of stdin and points fd 0 at NUL: spawning the
-    thumbnail processes otherwise hangs while a read is pending on the stdin pipe.
+    thumbnail processes otherwise hangs while a read is pending on the stdin pipe;
+  - the PAIR log is only read (`pairlog.ts` opens no connection); folder ids and run keys (`d_<id>~<runId>`)
+    last one server session, so the UI treats a 404 as "reload the list"; `/api/privacy/connections` passes only
+    validated integer pids to PowerShell.
   Never loosen the CSP, the window's request guard or the token handling.
 - Stop processes only through `dashboard.ps1 stop` (`-Force` if needed) or a job's cancel. They end only process
   ids they have verified; never stop node, electron or python by name.

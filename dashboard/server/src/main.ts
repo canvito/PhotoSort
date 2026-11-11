@@ -60,12 +60,16 @@ function writeState(state: object): void {
 }
 
 let fakePair: ChildProcess | undefined;
+// Fixture mode reads a synthetic PAIR log the fake PAIR writes; real mode reads PAIR's own log (routing only).
+const pairDir = mode === 'fixture'
+  ? path.join(dataDir, 'pair')
+  : path.join(process.env.LOCALAPPDATA ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Local'), 'NVIDIA Corporation', 'Personal AI Router');
 if (mode === 'fixture') {
   // Fixture mode never touches the real PAIR cluster: a deterministic fake Ollama answers instead.
   const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { base_url: string };
   const fakePort = new URL(cfg.base_url).port;
-  fakePair = spawn(python, [path.join(photosortDir, 'tests', 'fake_pair.py'), '--port', fakePort, '--parent-pid', String(process.pid)],
-    { stdio: 'ignore', windowsHide: true, shell: false });
+  fakePair = spawn(python, [path.join(photosortDir, 'tests', 'fake_pair.py'), '--port', fakePort, '--parent-pid', String(process.pid),
+    '--pair-dir', pairDir], { stdio: 'ignore', windowsHide: true, shell: false });
   fakePair.on('error', (e) => logger.error({ msg: 'fake PAIR failed to start', err: e.message }));
 }
 
@@ -98,6 +102,9 @@ const { app, hub } = await buildApp({
   fixtureRoots: mode === 'fixture' ? [path.join(dataDir, 'library')] : undefined,
   protectedDirs: [dataDir, path.join(process.env.LOCALAPPDATA ?? path.dirname(dataDir), 'PhotoSort'), photosortDir],
   webDist: path.join(dashDir, 'web', 'dist'),
+  pairDir,
+  // The fixture's synthetic member list names this PC "this-pc".
+  selfName: mode === 'fixture' ? 'this-pc' : undefined,
   logger,
   onShutdown: (job) => void shutdown(`api (job=${job})`),
 });

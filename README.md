@@ -481,11 +481,12 @@ pack is intended for personal/non-commercial use; review the model license befor
 
 ## Dashboard (`dashboard.ps1`)
 
-A desktop window for PhotoSort, built in phases. **Now (v1 = P0–P2):** the window, its local server, PAIR
-health, the privacy checks, **jobs** (sort, group, index, apply and undo with live progress) and **search and
-gallery** (plain-language search, browsing the whole index, thumbnails, previews and video playback). Later
-phases: P3 the full runs history, the cluster view and live privacy checks; P4 faces and settings. Until then
-those pages show the matching CLI command.
+A desktop window for PhotoSort, built in phases. **Now (P0–P3):** the window, its local server, PAIR
+health, **jobs** (sort, group, index, apply and undo with live progress), **search and gallery**
+(plain-language search, browsing the whole index, thumbnails, previews and video playback) and
+[**runs, cluster and privacy**](#runs-cluster-and-privacy) (every run including terminal ones, the PAIR cluster
+and its routing audit, live privacy checks). **Next (P4):** faces and settings; until then those two pages show
+the matching CLI command.
 
 ```powershell
 cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
@@ -531,7 +532,7 @@ while it loads and an error below the path if the folder cannot be opened. After
 | **Sort** | Preview, move or copy into buckets; optional destination, subfolders, and advanced limit, parallel requests, model and `--force` |
 | **Group** | A plain-language request (up to 500 characters, with examples); advanced folder name, From/To dates (To empty = today), photos/videos/both |
 | **Index** | Builds or refreshes the search index (unchanged files are skipped). It is the third tab of the Search page; results show up in Search and Browse as soon as the job finishes |
-| **Runs** | Every job with its result, filtered by kind; **Undo a folder's last run** previews undoing the latest run in that folder's journal |
+| **Runs** | Every sort, group, apply, index and undo, from the dashboard or a terminal, with each run's files and its apply or undo (see [Runs, cluster and privacy](#runs-cluster-and-privacy)) |
 | **Job** (`/jobs/<id>`) | Live progress, the per-file list (virtualized), what a group request understood, the finish report and its duration, and the next step: **Move these N files** or **Copy instead** after a preview, **Undo this run…** (a preview), then **Move N files back now**, or **Edit and run again**. A refused group request or a locked folder offers fixes (**Retry with photos only**, **Set the dates…**, **Run anyway…**) |
 
 - **One heavy job at a time.** Jobs that read many files or move them wait in a queue (a dock at the bottom
@@ -570,8 +571,8 @@ while it loads and an error below the path if the folder cannot be opened. After
 - Content protection is on: screenshots and screen sharing see a black window. The shield chip in the top bar
   turns it off, e.g. to share the screen. The Blur chip (Ctrl+Shift+B) blurs thumbnails and text.
 - The page has no access to Node.js or files.
-- Check it with `.\dashboard.ps1 start -Fixture -NoOpen`, then `.\dashboard.ps1 selftest -Fixture` (8 checks),
-  then `.\dashboard.ps1 stop -Fixture`.
+- Check it with `.\dashboard.ps1 start -Fixture -NoOpen`, then `.\dashboard.ps1 selftest -Fixture` (9 checks,
+  including that every page and a run's page draw without errors), then `.\dashboard.ps1 stop -Fixture`.
 
 **Graphics:** the window draws with the GPU. Chromium can't choose the GPU on Windows, so `dashboard.ps1` sets
 Windows' per-app graphics preference for the dashboard's own `electron.exe` before each launch. The value is
@@ -588,10 +589,52 @@ model runs on this PC.
   - `jobs\<id>\`: each job's record, events and CLI output (these do hold file names, like a terminal would);
   - `thumbs\`: the thumbnail and preview cache (metadata-free WebP, at most 3 GB); `media.key`: the secret for
     item ids;
+  - `folders.json`: the folders added on the Runs page (paths);
   - `shell\`: the window's browser cache.
 - `%LOCALAPPDATA%\PhotoSort\dashboard-fixture`: the same for `-Fixture`, plus the synthetic `library\`.
 - `%LOCALAPPDATA%\PhotoSort\locks`: the CLI's folder locks (see [Usage](#usage)), shared by both modes.
 - `dashboard\node_modules` and `dashboard\web\dist` are git-ignored.
+
+### Runs, cluster and privacy
+
+**Runs** lists every sort, group and apply recorded in the journals (`_photosort_journal.jsonl`) of the folders
+the dashboard knows, plus every dashboard job (index and undo included):
+- Runs started from a terminal carry a **terminal** tag. Their duration comes from the journal's timestamps, so
+  it is shown as an estimate (≈).
+- Known folders are those of dashboard jobs plus the ones you add under **Folders** (the picker, then **Add
+  folder**). **Remove** only forgets a folder; it changes nothing on disk.
+- Filters: kind (Sort, Group, Apply, Index, Undo) and origin (Dashboard, Terminal).
+- A run's page shows its counts, its buckets or group, and every file (200 at a time). A preview that was not
+  applied offers **Move these N files** or **Copy instead**. A move that was not undone offers **Undo this run…**
+  (a preview first, then **Move N files back now**).
+- A notice appears when OneDrive made a conflict copy of a folder's journal (`_photosort_journal-*.jsonl`); undo
+  reads only the main journal (see [Troubleshooting](#troubleshooting)).
+- Run links last until the dashboard restarts; an old link shows "Run not found".
+
+**Cluster** reads PAIR's own files on this PC: its log
+(`%LOCALAPPDATA%\NVIDIA Corporation\Personal AI Router\logs\nvpair.jsonl`, and `nvpair.1.jsonl` after rotation)
+and its member list (`cluster\members.json`). It sends nothing to the nodes. The log holds routing only (node,
+target address, path, status, timings), never prompts or images.
+- **Nodes:** state, models loaded, requests and latency (p50/p95) over the last 15 min, 1 h or 24 h. This PC is
+  tagged, and a node missing from the member list is flagged.
+- **Charts:** requests per node and latency over time.
+- **Routing audit:** where PAIR sent requests in the last 24 h and in the whole log, by class: LAN, loopback,
+  `cluster` (PAIR's model list), blank (never routed) and public. An **alert** is a request to a public address,
+  or a model request served by this PC. Alerts appear live in red.
+- **Models:** what each node has loaded, which ones PhotoSort uses, and any cloud models PAIR lists (never used).
+- If the log is missing or its format changed, the page says so; the rest of the dashboard keeps working.
+
+**Privacy** rechecks each time you open it or press **Check again**:
+- models are reached through PAIR on `127.0.0.1`, the configured models are local, and whether PAIR lists cloud
+  models (a warning: they are listed but never used);
+- system proxies are ignored, and the server can reach only PAIR's read-only endpoints;
+- the search index and the dashboard's data are outside OneDrive;
+- PAIR's routing audit (above);
+- the window's own guard: blocked network and content protection.
+
+**Check connections** lists every open TCP connection of the server, the Python helper and the window. Each is
+classed loopback, LAN, listening (on `127.0.0.1`), exposed (listening on another address) or bad (an internet
+address). Expected: only loopback and listening.
 
 ### Search and gallery
 
@@ -636,7 +679,7 @@ How it works:
 | Stop | 1.3–2.9 s (target ≤ 5 s) |
 | Opening the window | ~3.5 s |
 | `status` | 2.4 s (PowerShell 7), 3.5 s (5.1) |
-| Window self-test | 3.5–4.3 s |
+| Window self-test (including drawing 10 pages, 1.5 s each) | 18–20 s |
 | A file's progress reaching the window (CLI event to page, fixture run) | median 191 ms, p95 285 ms (target ≤ 500 ms) |
 | Fixture sort preview, 50 files, fake PAIR | 1.9 s |
 | `stop` while a job runs, with `-Yes` (stops the job safely first) | 1.0 s |
@@ -758,7 +801,9 @@ videos) and found **no photo, video, frame, face or caption sent to a cloud mode
 server connects only to PAIR on `127.0.0.1`, and its window only to that server. Its jobs run the same
 `photosort.py` with the same `local_only.py` guard, so their model requests go to PAIR on `127.0.0.1` only and
 refuse cloud models (the server refuses a cloud model name before starting a job, too).
-`.\dashboard.ps1 selftest -Fixture` rechecks the window's guard.
+`.\dashboard.ps1 selftest -Fixture` rechecks the window's guard. The dashboard's **Privacy** and **Cluster**
+pages rerun the PAIR routing count below and list the dashboard's open connections (see
+[Runs, cluster and privacy](#runs-cluster-and-privacy)).
 
 **Since the audit, `index-export` and `index-import`** copy the index between your PCs as a file, with no network
 or model call. `index-export` refuses OneDrive folders unless you add `--allow-onedrive`, and its file holds your
@@ -830,6 +875,9 @@ fixture mode. `server\test\gallery.test.ts` builds a synthetic indexed library
 refresh and that forged ids and paths are refused; `tests\test_dashboard_sidecar.py` checks that cached search
 equals the CLI's, metadata stripping, the cache limit and that cloud-only files are never opened. For the 31,000
 item measurement: `make_search_fixture.py --out <new folder in %TEMP%> --count 31000`.
+`server\test\pair.test.ts` checks the PAIR log reader on a synthetic log (`tests\fake_pair.py --pair-dir` writes
+one for fixture mode, with a made-up cluster), the routing alerts, the privacy checks and the connection classes;
+`e2e.test.ts` also checks that a run started from the CLI shows up under Runs.
 
 `server\test\fixture-window.test.ts` builds the current UI into a temporary folder and opens an isolated
 fixture-mode Electron window with empty synthetic folders. It checks Go/Enter, quoted paths, loading/error

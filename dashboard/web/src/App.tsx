@@ -5,12 +5,13 @@ import { JobDock } from './components/JobDock.tsx';
 import { PageErrorBoundary } from './components/ui.tsx';
 import { Icon } from './icons.tsx';
 import { JobsContext, useJobListSource } from './jobs.ts';
+import { ClusterPage } from './pages/Cluster.tsx';
 import { GroupPage } from './pages/Group.tsx';
 import { JobPage } from './pages/Job.tsx';
 import { Overview } from './pages/Overview.tsx';
 import { Placeholder } from './pages/Placeholder.tsx';
 import { Privacy } from './pages/Privacy.tsx';
-import { RunsPage } from './pages/Runs.tsx';
+import { RunPage, RunsPage } from './pages/Runs.tsx';
 import { SearchPage } from './pages/Search.tsx';
 import { SortPage } from './pages/Sort.tsx';
 
@@ -35,9 +36,12 @@ export interface Ctx {
   connected: boolean;
 }
 
-/** The nav entry a location belongs to; a job page belongs to Runs. */
+/** A job or run page (shown under Runs). */
+const isRunPage = (location: string): boolean => location.startsWith('/jobs/') || location.startsWith('/runs/');
+
+/** The nav entry a location belongs to; job and run pages belong to Runs. */
 function navOf(location: string): (typeof NAV)[number] | undefined {
-  if (location.startsWith('/jobs/')) return NAV.find((n) => n.path === '/runs');
+  if (isRunPage(location)) return NAV.find((n) => n.path === '/runs');
   return NAV.find((n) => n.path === location);
 }
 
@@ -104,7 +108,7 @@ export function App() {
       </nav>
       <div className="main">
         <header className="topbar">
-          <h1>{location.startsWith('/jobs/') ? 'Run' : here?.label ?? 'PhotoSort'}</h1>
+          <h1>{isRunPage(location) ? 'Run' : here?.label ?? 'PhotoSort'}</h1>
           <div className="topbar-right">
             {fixture && <span className="badge fixture" title="Synthetic test data only">FIXTURE</span>}
             <Link href="/" className={`pill ${pill.tone}`} title={ctx.pair?.error ?? ctx.pairError ?? 'Local NVIDIA PAIR proxy'}>
@@ -137,8 +141,9 @@ export function App() {
             <Route path="/search"><SearchPage /></Route>
             <Route path="/faces"><Placeholder page="faces" /></Route>
             <Route path="/runs"><RunsPage /></Route>
+            <Route path="/runs/:key">{(p) => <RunPage key={p.key} runKey={p.key} />}</Route>
             <Route path="/jobs/:id">{(p) => <JobPage key={p.id} id={p.id} />}</Route>
-            <Route path="/cluster"><Placeholder page="cluster" /></Route>
+            <Route path="/cluster"><ClusterPage /></Route>
             <Route path="/settings"><Placeholder page="settings" /></Route>
             <Route><div className="card"><h2>Not found</h2><p>This page does not exist. <Link href="/">Back to Overview</Link></p></div></Route>
           </Switch>

@@ -11,6 +11,10 @@ import { registerJobRoutes } from './routes.ts';
 import { cachedProbe } from './pyinfo.ts';
 import { Sidecar } from './sidecar.ts';
 import { registerGalleryRoutes } from './gallery.ts';
+import { registerRunRoutes } from './runs.ts';
+import { registerPairRoutes } from './cluster.ts';
+import { registerPrivacyRoutes } from './privacy.ts';
+import type { PairLog } from './pairlog.ts';
 
 declare module 'fastify' {
   interface FastifyContextConfig {
@@ -48,6 +52,12 @@ export interface AppOptions {
   isOurProcess?: (pid: number, jobId: string) => Promise<boolean>;
   /** How long a "cancel the job, then stop" request waits for the job (dashboard.ps1 waits 180 s). */
   shutdownWaitMs?: number;
+  /** PAIR's data folder (logs\nvpair.jsonl, cluster\members.json); default <dataDir>\pair. */
+  pairDir?: string;
+  /** This PC's name in PAIR's member list (default: the computer name). */
+  selfName?: string;
+  /** Tests: stand-in for Get-NetTCPConnection. */
+  listConnections?: Parameters<typeof registerPrivacyRoutes>[1]['listConnections'];
 }
 
 export interface App {
@@ -56,6 +66,7 @@ export interface App {
   jobs: JobManager;
   dirs: DirRegistry;
   sidecar: Sidecar;
+  pair: PairLog;
 }
 
 const startedAt = new Date().toISOString();
@@ -88,6 +99,11 @@ export async function buildApp(opts: AppOptions): Promise<App> {
   registerJobRoutes(app, jobs, dirs);
   const sidecar = new Sidecar({ ...opts, hub });
   registerGalleryRoutes(app, sidecar, dirs);
+  await registerRunRoutes(app, opts.dataDir, dirs, jobs, sidecar);
+  const pair = registerPairRoutes(app, {
+    pairDir: opts.pairDir ?? path.join(opts.dataDir, 'pair'), configPath: opts.configPath, hub, selfName: opts.selfName,
+  });
+  registerPrivacyRoutes(app, { configPath: opts.configPath, dataDir: opts.dataDir, pair, jobs, sidecar, listConnections: opts.listConnections });
   const pythonInfo = cachedProbe(opts.python, opts.photosortDir);
 
   app.get('/healthz', { config: { auth: 'public' } }, async () => ({ ok: true, version: opts.version, mode: opts.mode }));
@@ -160,5 +176,5 @@ export async function buildApp(opts: AppOptions): Promise<App> {
   });
 
   app.addHook('onClose', async () => { await Promise.all([jobs.close(), sidecar.close()]); });
-  return { app, hub, jobs, dirs, sidecar };
+  return { app, hub, jobs, dirs, sidecar, pair };
 }

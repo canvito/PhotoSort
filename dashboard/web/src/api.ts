@@ -29,6 +29,8 @@ export interface ShellInfo {
   gpuFeatures: Record<string, string>;
   protection: boolean;
   blockedRequests: number;
+  /** The window's own processes, for the open-connections check. */
+  pids?: number[];
 }
 
 export interface PythonInfo {
@@ -145,6 +147,170 @@ export interface JobList {
   queued: number;
 }
 
+/** A run from a folder's journal (made by the dashboard or from a terminal), or a dashboard job with no run. */
+export interface RunRow {
+  /** `<dirId>~<runId>` for journal runs, `job~<id>` for jobs; dir ids change when the dashboard restarts. */
+  key: string;
+  origin: 'journal' | 'job';
+  folder?: DirInfo;
+  runId?: string;
+  kind: string;
+  of?: string | null;
+  action?: string;
+  model?: string | null;
+  startedAt?: string;
+  endedAt?: string;
+  files: number;
+  done: number;
+  errors: number;
+  matched: number;
+  buckets: Record<string, number>;
+  group?: string | null;
+  request?: string | null;
+  appliedFrom?: string | null;
+  restored: number;
+  undone?: { at?: string; restored?: number; problems?: number } | null;
+  appliedBy: string[];
+  canUndo: boolean;
+  canApply: boolean;
+  durationS?: number | null;
+  durationExact: boolean;
+  jobId?: string;
+  jobStatus?: JobStatus;
+  terminal: boolean;
+}
+
+export interface FolderRow extends DirInfo {
+  registered: boolean;
+  fromJobs: boolean;
+  journal: boolean;
+  runs: number;
+  conflicts: { name: string; runs: number }[];
+  error?: string;
+}
+
+export interface RunItem {
+  n: number;
+  src: string;
+  name: string;
+  dst?: string | null;
+  bucket?: string | null;
+  group?: string | null;
+  match?: boolean | null;
+  confidence?: number | null;
+  error?: string | null;
+  restored: boolean;
+}
+
+export interface RunItems {
+  run_id: string;
+  total: number;
+  offset: number;
+  items: RunItem[];
+}
+
+export type TargetClass = 'lan' | 'loopback' | 'cluster' | 'blank' | 'public';
+
+export interface PairNode {
+  id: string;
+  name: string;
+  ip?: string;
+  state?: string;
+  lastSeen?: string;
+  self: boolean;
+  member: boolean;
+  stale: boolean;
+  lastActivity?: string;
+  engineHealthy?: boolean;
+  engineRunning?: boolean;
+  engineCheckedAt?: string;
+  models?: string[];
+  requests: number;
+  perMin: number;
+  p50?: number;
+  p95?: number;
+  ttfbP50?: number;
+  errors: number;
+  errorRate?: number;
+  share: number;
+}
+
+export interface PairLogStatus {
+  found: boolean;
+  format: 'ok' | 'unrecognized' | 'empty';
+  lines: number;
+}
+
+export interface PairNodes {
+  status: PairLogStatus;
+  window: string;
+  nodes: PairNode[];
+}
+
+export interface PairStats {
+  window: string;
+  start: string;
+  binS: number;
+  series: { name: string; counts: number[] }[];
+  p50: (number | null)[];
+  p95: (number | null)[];
+  total: number;
+  errors: number;
+  overallP50?: number;
+  overallP95?: number;
+}
+
+export interface PairAlert {
+  t: string;
+  kind: 'public_target' | 'this_pc';
+  node: string;
+  target: string;
+  path: string;
+}
+
+export interface PairAudit extends PairLogStatus {
+  firstT?: string;
+  lastT?: string;
+  day: { counts: Record<TargetClass, number>; alerts: number };
+  all: { counts: Record<TargetClass, number>; alerts: number };
+  recentAlerts: PairAlert[];
+}
+
+export interface PairModels {
+  reachable: boolean;
+  error?: string;
+  models: { name: string; size?: number; cloud: boolean; used: boolean; family?: string; parameterSize?: string; quantization?: string }[];
+  loaded: { name: string; size?: number; sizeVram?: number; expiresAt?: string }[];
+}
+
+export interface PrivacyCheck {
+  id: string;
+  label: string;
+  status: 'ok' | 'warn' | 'bad' | 'unknown';
+  detail: string;
+}
+
+export interface PrivacyReport {
+  checkedAt: string;
+  host: string;
+  checks: PrivacyCheck[];
+}
+
+export type ConnClass = 'loopback' | 'lan' | 'listening' | 'exposed' | 'bad';
+
+export interface Connections {
+  checkedAt: string;
+  processes: { pid: number; role: string }[];
+  connections: { pid: number; role: string; local: string; remote: string; state: string; cls: ConnClass }[];
+  summary: Record<ConnClass, number>;
+}
+
+/** What the server sends on the "pair" stream. */
+export interface PairEvent {
+  type: 'alert' | 'reconnected';
+  alert?: PairAlert;
+}
+
 declare global {
   interface Window {
     photosort?: {
@@ -231,6 +397,18 @@ export interface IndexEvent {
 // single stream.
 const jobBus = new EventTarget();
 const indexBus = new EventTarget();
+const pairBus = new EventTarget();
+
+/** Calls `cb` for every PAIR routing alert (a request sent off the LAN or to this PC), and after reconnects. */
+export function usePairEvents(cb: (e: PairEvent) => void): void {
+  const handler = useRef(cb);
+  handler.current = cb;
+  useEffect(() => {
+    const on = (e: Event) => handler.current((e as CustomEvent<PairEvent>).detail);
+    pairBus.addEventListener('pair', on);
+    return () => pairBus.removeEventListener('pair', on);
+  }, []);
+}
 
 /** Calls `cb` for every index event, and with `{type: 'reconnected'}` after the stream reconnects. */
 export function useIndexEvents(cb: (e: IndexEvent) => void): void {
@@ -268,6 +446,7 @@ export function useServerEvents(onSys: (e: SysEvent) => void): boolean {
       if (opened) {
         jobBus.dispatchEvent(new CustomEvent('job', { detail: { type: 'reconnected' } }));
         indexBus.dispatchEvent(new CustomEvent('index', { detail: { type: 'reconnected' } }));
+        pairBus.dispatchEvent(new CustomEvent('pair', { detail: { type: 'reconnected' } }));
       }
       opened = true;
     };
@@ -296,6 +475,15 @@ export function useServerEvents(onSys: (e: SysEvent) => void): boolean {
         return;
       }
       indexBus.dispatchEvent(new CustomEvent('index', { detail }));
+    });
+    es.addEventListener('pair', (m) => {
+      let detail: PairEvent;
+      try {
+        detail = JSON.parse((m as MessageEvent<string>).data) as PairEvent;
+      } catch {
+        return;
+      }
+      pairBus.dispatchEvent(new CustomEvent('pair', { detail }));
     });
     return () => es.close();
   }, []);

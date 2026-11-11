@@ -641,6 +641,91 @@ def read_journal(journal: Path) -> list[dict]:
     return [json.loads(line) for line in Path(journal).read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _seconds_between(a: str | None, b: str | None) -> float | None:
+    try:
+        return max(0.0, (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def journal_runs(entries: list[dict]) -> list[dict]:
+    """One summary per run of a journal, newest first. Pure: reads no files and changes nothing.
+
+    A run's own lines are its per-file results; the "restore" and "undo" lines an undo writes under the same run id
+    count as that run's undo. `duration_s` comes from the journal's timestamps (one-second resolution), so it is an
+    estimate. `can_undo` and `can_apply` say whether `undo` or `apply` would find something to do."""
+    runs: dict[str, dict] = {}
+    restored: Counter = Counter()
+    undone: dict[str, dict] = {}
+    for e in entries:
+        rid, action, ts = e.get("run_id"), e.get("action"), e.get("ts")
+        if not isinstance(rid, str):
+            continue
+        if action == "restore":
+            restored[rid] += 1
+            continue
+        if action == "undo":
+            undone[rid] = {"ts": ts, "restored": e.get("restored"), "problems": e.get("problems")}
+            continue
+        r = runs.get(rid)
+        if r is None:
+            r = runs[rid] = {"run_id": rid, "kind": "sort", "of": None, "action": action, "model": e.get("model"),
+                             "started": ts, "ended": ts, "files": 0, "done": 0, "errors": 0, "matched": 0,
+                             "buckets": Counter(), "group": None, "request": None, "applied_from": None,
+                             "_picked": 0, "_fp": 0}
+        if isinstance(ts, str):
+            r["started"] = min(r["started"] or ts, ts)
+            r["ended"] = max(r["ended"] or ts, ts)
+        r["files"] += 1
+        error = bool(e.get("error"))
+        r["errors"] += error
+        r["done"] += bool(e.get("dst"))
+        if "group" in e:
+            r["group"], r["request"] = e.get("group"), e.get("request")
+            r["matched"] += bool(e.get("match")) and not error
+            picked = bool(e.get("match")) and not error
+        else:
+            picked = bool(e.get("bucket")) and not error
+            if picked:
+                r["buckets"][e["bucket"]] += 1
+        r["_picked"] += picked
+        r["_fp"] += picked and bool(e.get("fp"))
+        if e.get("applied_from"):
+            r["applied_from"] = e["applied_from"]
+    out = []
+    for rid, r in runs.items():
+        kind = "group" if r["group"] is not None else "sort"
+        if r["applied_from"]:
+            r["kind"], r["of"] = "apply", kind
+        else:
+            r["kind"] = kind
+        r["restored"] = restored.get(rid, 0)
+        r["undone"] = undone.get(rid)
+        r["applied_by"] = [o for o, x in runs.items() if x["applied_from"] == rid]
+        live_apply = [o for o in r["applied_by"] if o not in undone]
+        r["can_undo"] = r["action"] == "move" and r["done"] > r["restored"] and r["undone"] is None
+        r["can_apply"] = (r["action"] == "report" and not live_apply and r["_picked"] > 0
+                          and r["_fp"] == r["_picked"])
+        r["duration_s"] = _seconds_between(r["started"], r["ended"])
+        r["buckets"] = dict(r["buckets"].most_common())
+        del r["_picked"], r["_fp"]
+        out.append(r)
+    return sorted(out, key=lambda r: (r["started"] or "", r["run_id"]), reverse=True)
+
+
+def journal_items(entries: list[dict], run_id: str, offset: int = 0, limit: int = 500) -> dict:
+    """The per-file results of one run (without its undo lines), in journal order. Pure."""
+    back = {(e.get("src"), e.get("dst")) for e in entries if e.get("action") == "restore" and e.get("run_id") == run_id}
+    rows = [e for e in entries if e.get("run_id") == run_id and e.get("action") not in ("restore", "undo")]
+    items = []
+    for n, e in enumerate(rows[offset:offset + limit], offset + 1):
+        src = e.get("src") or ""
+        items.append({"n": n, "src": src, "name": Path(src).name, "dst": e.get("dst"), "bucket": e.get("bucket"),
+                      "group": e.get("group"), "match": e.get("match"), "confidence": e.get("confidence"),
+                      "error": e.get("error"), "restored": bool(e.get("dst")) and (src, e.get("dst")) in back})
+    return {"run_id": run_id, "total": len(rows), "offset": offset, "items": items}
+
+
 def plan_undo(entries: list[dict], run_id: str | None = None) -> dict:
     """What undoing a run would do; changes nothing. Default run: the latest move run not yet undone. Files an
     interrupted undo already moved back (its "restore" lines) are left out."""

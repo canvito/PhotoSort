@@ -1176,6 +1176,30 @@ def test_apply_moves_exactly_the_previewed_files_and_leaves_changed_ones_alone(t
     assert photosort.apply_preview(CFG, journal)["applied"] == 2  # and then the preview can be applied again
 
 
+def test_journal_runs_summarizes_previews_applies_and_undos(tmp_path):
+    make_photos(tmp_path, ["selfie.jpg", "lunch.jpg", "chat.png"])
+    preview = photosort.sort_folder(CFG, tmp_path, action="report", classifier=FakeClassifier())
+    journal = tmp_path / photosort.JOURNAL_NAME
+    first = photosort.journal_runs(photosort.read_journal(journal))
+    assert [(r["run_id"], r["kind"], r["action"], r["files"], r["can_apply"], r["can_undo"]) for r in first] == \
+        [(preview["run_id"], "sort", "report", 3, True, False)]
+    assert first[0]["buckets"] == {"people": 1, "food": 1, "screenshot_chat": 1} and first[0]["duration_s"] >= 0
+
+    applied = photosort.apply_preview(CFG, journal)
+    photosort.undo(journal)
+    entries = photosort.read_journal(journal)
+    runs = {r["run_id"]: r for r in photosort.journal_runs(entries)}
+
+    a = runs[applied["run_id"]]
+    assert (a["kind"], a["of"], a["action"], a["done"], a["restored"], a["can_undo"]) == ("apply", "sort", "move", 3, 3, False)
+    assert a["undone"] == {"ts": a["undone"]["ts"], "restored": 3, "problems": 0}
+    p = runs[preview["run_id"]]
+    assert p["applied_by"] == [applied["run_id"]] and p["can_apply"]  # its apply was undone: it can be applied again
+    items = photosort.journal_items(entries, applied["run_id"], offset=1, limit=5)
+    assert (items["total"], [i["n"] for i in items["items"]]) == (3, [2, 3])
+    assert all(i["restored"] and i["bucket"] for i in items["items"])
+
+
 def test_apply_a_group_preview_makes_the_group_folder_without_asking_the_model_again(tmp_path):
     for name, when in {"party_cake.jpg": "2026:11:08 15:00:00", "party_games.jpg": "2026:11:08 15:10:00",
                        "cake.jpg": "2026:11:08 16:00:00"}.items():

@@ -2,7 +2,7 @@
 // fresh synthetic library, and a real SSE client listens. Covers sort, apply, undo (preview first), group, index,
 // a safe stop, and measures M7 (CLI event -> SSE in the page, at most 500 ms).
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -260,6 +260,53 @@ describe('dashboard jobs against the real CLI and fake PAIR', () => {
     expect(again.summary).toMatchObject({ images: MEDIA, captioned: 0, unchanged: MEDIA, errors: 0 });
     expect((await fake.stats()).chat).toBe(asked.chat);
   }, 300000);
+
+  it('lists every run: dashboard runs joined to their jobs, and terminal runs from an added folder', async () => {
+    const get = async (url: string) => {
+      const r = await built.app.inject({ url, headers: auth() });
+      return { status: r.statusCode, body: r.json() as Record<string, unknown> };
+    };
+    type Row = Record<string, unknown> & { kind: string; origin: string; key: string };
+    const first = (await get('/api/runs')).body as { runs: Row[]; folders: Record<string, unknown>[] };
+    const fromJournal = first.runs.filter((r) => r.origin === 'journal');
+    expect(fromJournal.map((r) => `${r.kind}:${r.action}`).sort()).toEqual(['apply:move', 'apply:move', 'group:report', 'sort:report']);
+    expect(fromJournal.every((r) => r.jobId && r.terminal === false && r.durationExact === true)).toBe(true);
+    const sortPreview = fromJournal.find((r) => r.kind === 'sort')!;
+    expect(sortPreview).toMatchObject({ files: MEDIA, canApply: true, buckets: { nature: 10, documents_receipts: 4, screenshot_other: 4, food: 4, people: 4 } });
+    for (const a of fromJournal.filter((r) => r.kind === 'apply')) expect(a).toMatchObject({ canUndo: false, undone: { restored: expect.any(Number) } });
+    expect(first.runs.filter((r) => r.origin === 'job').map((r) => r.kind).sort()).toEqual(['index', 'index', 'undo', 'undo', 'undo', 'undo']);
+    expect(first.folders).toMatchObject([{ path: lib, fromJobs: true, registered: false, journal: true }]);
+
+    // A run made from a terminal in another folder: only its journal knows about it.
+    const other = path.join(lib, 'from terminal');
+    mkdirSync(other);
+    const rid = '20260102-100000-abcdef';
+    const line = (name: string, bucket: string, ts: string) => JSON.stringify({ ts, run_id: rid, action: 'move', model: 'm',
+      src: path.join(other, name), dst: path.join(other, bucket, name), bucket, confidence: 0.9, fp: 'x' });
+    writeFileSync(path.join(other, '_photosort_journal.jsonl'),
+      `${line('x.jpg', 'nature', '2026-01-02T10:00:00')}\n${line('y.jpg', 'food', '2026-01-02T10:00:03')}\n{"half a line`);
+    writeFileSync(path.join(other, '_photosort_journal-OTHERPC.jsonl'), '');
+    const dir = (await post('/api/fs/resolve', { path: other })).body.dirId as string;
+    expect((await post('/api/folders', { dir })).status).toBe(200);
+    expect(readFileSync(path.join(tmp, 'app', 'folders.json'), 'utf8')).toContain('from terminal');
+
+    const second = (await get('/api/runs')).body as { runs: Row[]; folders: Record<string, unknown>[] };
+    const term = second.runs.find((r) => r.runId === rid)!;
+    expect(term).toMatchObject({ terminal: true, kind: 'sort', action: 'move', files: 2, canUndo: true, durationS: 3, durationExact: false,
+      buckets: { nature: 1, food: 1 }, startedAt: new Date('2026-01-02T10:00:00').toISOString() });
+    expect(second.folders.find((f) => f.dirId === dir)).toMatchObject({ registered: true, conflicts: [{ name: '_photosort_journal-OTHERPC.jsonl', runs: 0 }] });
+    expect((await get(`/api/runs/${term.key}`)).body).toMatchObject({ run: { runId: rid, terminal: true } });
+    const items = (await get(`/api/runs/${term.key}/items?offset=1&limit=5`)).body;
+    expect(items).toMatchObject({ total: 2, offset: 1, items: [{ n: 2, name: 'y.jpg', bucket: 'food', restored: false }] });
+    expect((await get(`/api/runs/${dir}~20260102-100000-000000`)).status).toBe(404);
+    expect((await get(`/api/runs/d_${'A'.repeat(22)}~${rid}`)).status).toBe(404);
+    expect((await get('/api/runs/not-a-key')).status).toBe(400);
+
+    const del = await built.app.inject({ method: 'DELETE', url: `/api/folders/${dir}`, headers: { ...auth(), origin: `http://${host}` } });
+    expect(del.statusCode).toBe(200);
+    expect(((await get('/api/runs')).body.runs as Row[]).some((r) => r.runId === rid)).toBe(false);
+    rmSync(other, { recursive: true });
+  }, 60000);
 
   it('stops safely: every moved file is journaled and nothing is lost or half-moved', async () => {
     const slow = await startFakePair(150);

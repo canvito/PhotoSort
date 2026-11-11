@@ -101,6 +101,8 @@ function info() {
     gpuFeatures: app.getGPUFeatureStatus(),
     protection,
     blockedRequests: blocked,
+    // The window's own processes, for the Privacy page's open-connections check.
+    pids: app.getAppMetrics().map((m) => m.pid).slice(0, 16),
   };
 }
 
@@ -256,6 +258,34 @@ async function main() {
                hasRequire: typeof require !== 'undefined', hasProcess: typeof process !== 'undefined' };
     })()`);
     log('selftest: page checked');
+    // Every page renders: none falls into the error boundary or stays blank, and none logs an error.
+    /** @type {string[]} */
+    const consoleErrors = [];
+    win.webContents.on('console-message', (/** @type {any} */ e, /** @type {any} */ level, /** @type {any} */ message) => {
+      const lvl = e?.level ?? level;
+      if (lvl === 'error' || lvl === 3) consoleErrors.push(String(e?.message ?? message).slice(0, 200));
+    });
+    /** @type {Record<string, unknown>} */
+    const pages = {};
+    for (const p of ['/', '/sort', '/group', '/search', '/faces', '/runs', '/cluster', '/settings', '/privacy', '/runs/:first']) {
+      const before = consoleErrors.length;
+      pages[p] = await win.webContents.executeJavaScript(`(async () => {
+        let p = ${JSON.stringify(p)};
+        if (p === '/runs/:first') {
+          const runs = (await (await fetch('/api/runs')).json()).runs.filter((r) => !r.key.startsWith('job~'));
+          if (!runs.length) return { skipped: true, text: 1, crashed: false };
+          p = '/runs/' + encodeURIComponent(runs[0].key);
+        }
+        history.pushState(null, '', p);
+        await new Promise((r) => setTimeout(r, 1500));
+        const content = document.querySelector('.content');
+        const bad = new Set(['This page hit a problem', 'Run not found']);
+        return { text: (content?.innerText ?? '').trim().length,
+                 crashed: [...document.querySelectorAll('.content [role=alert] h2')].some((h) => bad.has(h.textContent ?? '')) };
+      })()`);
+      Object.assign(/** @type {object} */ (pages[p]), { errors: consoleErrors.slice(before) });
+    }
+    log('selftest: pages rendered');
     const before = blocked;
     const probeWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
     const html = '<img src="https://example.com/x.png"><img src="http://192.168.0.1/x.png">' +
@@ -269,6 +299,7 @@ async function main() {
     const result = {
       ...info(),
       page,
+      pages,
       stayedOnOrigin: ownOrigin(win.webContents.getURL()),
       blockedByProbe: blocked - before,
       blockedHosts: Object.fromEntries(blockedHosts),

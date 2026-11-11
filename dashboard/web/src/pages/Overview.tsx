@@ -94,8 +94,8 @@ export function Overview({ ctx, reloadHealth }: { ctx: Ctx; reloadHealth(): void
         <h2>Coming next</h2>
         <ul className="plain">
           <li><b>P1 ✓</b> Sort, Group and Index jobs with live progress, safe stop, apply-preview and undo</li>
-          <li><b>P2</b> Search and a fast gallery with thumbnails and video playback</li>
-          <li><b>P3</b> Runs history, PAIR cluster view and the full privacy audit</li>
+          <li><b>P2 ✓</b> Search and a fast gallery with thumbnails and video playback</li>
+          <li><b>P3 ✓</b> Runs history (terminal runs too), PAIR cluster view and the live privacy audit</li>
           <li><b>P4</b> Faces, settings editor and polish</li>
         </ul>
       </section>

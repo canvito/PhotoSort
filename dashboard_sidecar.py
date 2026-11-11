@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -19,9 +20,12 @@ import numpy as np
 from local_only import LocalOnlyError, under_onedrive
 from photo_search import (PairSearchClient, SearchError, _folder_key, _is_under, from_blobs, index_path,
                           ranked_indices, score_vectors, settings)
-from photosort import IMAGE_EXTS, encode_image, load_config
+from photosort import IMAGE_EXTS, encode_image, journal_items, journal_runs, load_config
 from media import VIDEO_EXTS, is_video
 from thumbs import MediaUnavailable, ThumbCache, is_placeholder, media_stat, revision
+
+
+JOURNAL_RE = re.compile(r"^_photosort_journal(-[^\\/]+)?\.jsonl$", re.IGNORECASE)
 
 
 class Library:
@@ -236,8 +240,59 @@ class Service:
             raise LocalOnlyError("Dashboard data must stay outside OneDrive.")
         self.library = Library(load_config(config_path), data_dir, roots, notify)
         self.cache = ThumbCache(data_dir / "thumbs")
+        self._journals: dict[str, tuple] = {}
+        self._journal_lock = threading.Lock()
+
+    def _journal_path(self, raw: str) -> Path:
+        p = Path(raw)
+        if (not p.is_absolute() or str(p).startswith("\\\\") or not JOURNAL_RE.match(p.name)
+                or os.path.islink(p)):
+            raise LocalOnlyError("not a PhotoSort journal")
+        if self.library.roots is not None and not any(p.parent.resolve().is_relative_to(r) for r in self.library.roots):
+            raise LocalOnlyError("outside the fixture library")
+        return p
+
+    def journal_entries(self, raw: str) -> list[dict]:
+        """A journal's lines, cached by size and modified time. A line that does not parse (a run is writing it, or
+        OneDrive mangled the file) is skipped, never fatal."""
+        p = self._journal_path(raw)
+        st = p.stat()
+        key = (st.st_size, st.st_mtime_ns)
+        with self._journal_lock:
+            hit = self._journals.get(str(p))
+            if hit and hit[0] == key:
+                return hit[1]
+        entries = []
+        with p.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict):
+                    entries.append(e)
+        with self._journal_lock:
+            if len(self._journals) > 32:
+                self._journals.clear()
+            self._journals[str(p)] = (key, entries)
+        return entries
+
+    def journal_runs(self, journal: str) -> dict:
+        p = self._journal_path(journal)
+        out = {"runs": journal_runs(self.journal_entries(journal)) if p.is_file() else [], "conflicts": []}
+        for copy in sorted(p.parent.glob("_photosort_journal-*.jsonl")):
+            try:
+                out["conflicts"].append({"name": copy.name, "runs": len(journal_runs(self.journal_entries(str(copy))))})
+            except (OSError, LocalOnlyError):
+                continue
+        return out
 
     def call(self, method: str, params: dict):
+        if method == "journal.runs":
+            return self.journal_runs(str(params["journal"]))
+        if method == "journal.items":
+            return journal_items(self.journal_entries(str(params["journal"])), str(params["runId"]),
+                                 max(0, int(params.get("offset", 0))), min(5000, max(1, int(params.get("limit", 500)))))
         lib = self.library
         with lib.lock:
             if method == "index.stats":

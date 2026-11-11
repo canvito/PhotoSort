@@ -660,10 +660,13 @@ function Invoke-SelfTest {
     Set-GpuPreference $choice
     $argv = @((Join-Path $DashDir 'shell'), '--state', $StatePath, '--gpu', $choice, '--self-test', $out)
     $p = Start-Process -FilePath $ElectronExe -ArgumentList (Join-Args $argv) -WorkingDirectory $DashDir -PassThru
-    if (-not $p.WaitForExit(45000)) { Stop-Process -Id $p.Id -Force; Fail 'The window self-test timed out.' 1 }
+    if (-not $p.WaitForExit(75000)) { Stop-Process -Id $p.Id -Force; Fail 'The window self-test timed out.' 1 }
     $r = Read-JsonFile $out
     if (-not $r) { Fail 'The window self-test wrote no result.' 1 }
     $hosts = @($r.blockedHosts.PSObject.Properties | ForEach-Object { $_.Name })
+    $pageNames = @($r.pages.PSObject.Properties | Where-Object { -not $_.Value.skipped } | ForEach-Object { $_.Name })
+    $badPages = @($r.pages.PSObject.Properties | Where-Object {
+            $_.Value.crashed -or $_.Value.text -lt 1 -or ($_.Value.errors | Measure-Object).Count -gt 0 } | ForEach-Object { $_.Name })
     $gpuName = 'unknown'
     if ($r.gpuDevice) { $gpuName = [string]$r.gpuDevice.vendor }
     # Only meaningful on hybrid laptops (Intel iGPU plus NVIDIA/AMD); single-GPU machines always pass.
@@ -679,6 +682,7 @@ function Invoke-SelfTest {
         @('Page bridge exposes only info and setProtection', ((@($r.page.bridge) -join ',') -eq 'info,setProtection')),
         @('Requests to the internet and LAN are blocked', ($r.blockedByProbe -ge 3 -and $hosts -contains 'example.com' -and $hosts -contains '192.168.0.1')),
         @('Navigation away from the dashboard is blocked', [bool]$r.stayedOnOrigin),
+        @("Every page renders without errors ($($pageNames.Count) pages)", ($pageNames.Count -ge 9 -and $badPages.Count -eq 0)),
         @('GPU compositing is on', ([string]$r.gpuFeatures.gpu_compositing -like 'enabled*')),
         @("The window runs on the chosen GPU ($choice)", $gpuOk)
     )
@@ -687,6 +691,10 @@ function Invoke-SelfTest {
         if ($c[1]) { Say "  PASS  $($c[0])" } else { Say "  FAIL  $($c[0])"; $failed++ }
     }
     Say ('  Info: GPU {0} (choice {1}), video decode {2}, blocked hosts: {3}' -f $gpuName, $r.gpuChoice, $r.gpuFeatures.video_decode, ($hosts -join ', '))
+    foreach ($name in $badPages) {
+        $pg = $r.pages.$name
+        Say ('  Page {0}: crashed={1}, text={2}, errors: {3}' -f $name, [bool]$pg.crashed, $pg.text, (@($pg.errors) -join ' | '))
+    }
     Say "Self-test finished in $(Format-Seconds $sw): $($checks.Count - $failed) of $($checks.Count) passed."
     if ($failed -gt 0) { return 1 }
     return 0

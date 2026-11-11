@@ -154,6 +154,29 @@ def test_missing_index_can_appear_after_sidecar_start(tmp_path):
         lib.close()
 
 
+def test_journal_runs_skip_a_half_written_line_refuse_other_files_and_list_conflict_copies(tmp_path):
+    cfg, root = fixture_index(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(cfg))
+    svc = Service(config, tmp_path / "data", [root])
+    journal = root / "_photosort_journal.jsonl"
+    line = {"ts": "2026-10-01T09:00:00", "run_id": "20261001-090000-abcdef", "action": "move", "src": str(root / "a.jpg"),
+            "dst": str(root / "people" / "a.jpg"), "bucket": "people"}
+    journal.write_text(json.dumps(line) + "\n" + '{"ts": "2026-10-01T09:00:01", "run_id": "2026', encoding="utf-8")
+    (root / "_photosort_journal-OTHERPC.jsonl").write_text(json.dumps({**line, "run_id": "20261002-090000-abcdef"}) + "\n")
+    try:
+        out = svc.call("journal.runs", {"journal": str(journal)})
+        assert [(r["run_id"], r["files"], r["can_undo"]) for r in out["runs"]] == [("20261001-090000-abcdef", 1, True)]
+        assert out["conflicts"] == [{"name": "_photosort_journal-OTHERPC.jsonl", "runs": 1}]
+        items = svc.call("journal.items", {"journal": str(journal), "runId": "20261001-090000-abcdef"})
+        assert (items["total"], items["items"][0]["name"]) == (1, "a.jpg")
+        for bad in (str(root / "notes.jsonl"), str(tmp_path / "_photosort_journal.jsonl"), "_photosort_journal.jsonl"):
+            with pytest.raises(LocalOnlyError):
+                svc.call("journal.runs", {"journal": bad})
+    finally:
+        svc.close()
+
+
 def test_index_inside_onedrive_is_refused(tmp_path, monkeypatch):
     cfg, root = fixture_index(tmp_path)
     monkeypatch.setenv("OneDrive", str(tmp_path))

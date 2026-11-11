@@ -6,7 +6,11 @@ code in its top-left corner (dashboard\\fixtures\\make_fixtures.py), and request
 group, index and search give predictable results. One cloud model is listed on purpose, so the cloud-model checks
 have something to catch. GET /fake/stats counts the requests (tests check that `apply` asks nothing).
 
-    python tests\\fake_pair.py --port 47617 [--parent-pid PID] [--delay-ms N] [--fail-rate F]
+With --pair-dir it also keeps a synthetic PAIR log (logs\\nvpair.jsonl, rotated to nvpair.1.jsonl) and member list
+(cluster\\members.json) there, in PAIR's formats, for the dashboard's Cluster page: 36 hours of made-up history on
+start, then one routing entry per request it answers. Every address is a made-up private 192.168.50.x one.
+
+    python tests\\fake_pair.py --port 47617 [--parent-pid PID] [--delay-ms N] [--fail-rate F] [--pair-dir DIR]
 """
 import argparse
 import base64
@@ -19,8 +23,10 @@ import re
 import sys
 import threading
 import time
+import uuid
 import zlib
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -141,6 +147,109 @@ def embed(texts):
     return rows
 
 
+# Synthetic PAIR cluster: three LAN nodes that serve models, this PC (a member that serves nothing) and a member
+# that left long ago.
+FAKE_NODES = [
+    {"name": "fixture-node-a", "ip": "192.168.50.11", "uuid": "a0000000-0000-4000-8000-00000000000a", "speed": 1.0},
+    {"name": "fixture-node-b", "ip": "192.168.50.12", "uuid": "b0000000-0000-4000-8000-00000000000b", "speed": 1.4},
+    {"name": "fixture-node-c", "ip": "192.168.50.13", "uuid": "c0000000-0000-4000-8000-00000000000c", "speed": 2.2},
+]
+FAKE_SELF = {"name": "this-pc", "ip": "192.168.50.10", "uuid": "d0000000-0000-4000-8000-00000000000d"}
+FAKE_STALE = {"name": "fixture-old-node", "ip": "10.99.0.7", "uuid": "e0000000-0000-4000-8000-00000000000e"}
+
+
+def _iso(t: datetime) -> str:
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+
+
+class FakePairLog:
+    """Writes routing entries the way PAIR does: each request as a `proxy/request-started` line, then a
+    `proxy/request` line, plus the same request again in the older JSON-RPC form."""
+
+    def __init__(self, root: Path, now: datetime | None = None, seed: int = 7):
+        self.root, self.lock, self.turn = Path(root), threading.Lock(), 0
+        self.rng = random.Random(seed)
+        self.last_poll = 0.0
+        (self.root / "logs").mkdir(parents=True, exist_ok=True)
+        (self.root / "cluster").mkdir(parents=True, exist_ok=True)
+        now = now or datetime.now(timezone.utc)
+        self.write_members(now)
+        self.write_history(now)
+
+    @property
+    def file(self) -> Path:
+        return self.root / "logs" / "nvpair.jsonl"
+
+    def write_members(self, now: datetime) -> None:
+        def member(n, seen, state="member"):
+            return {"admissionEpoch": 1, "clusterId": "fixture-cluster", "id": "peer-" + n["uuid"][:8], "ipAddress": n["ip"],
+                    "joinedAt": _iso(now - timedelta(days=30)), "lastSeen": _iso(seen), "name": n["name"],
+                    "nodeUuid": n["uuid"], "port": 47800, "state": state}
+        members = [member(n, now) for n in FAKE_NODES] + [member(FAKE_SELF, now), member(FAKE_STALE, now - timedelta(days=9))]
+        (self.root / "cluster" / "members.json").write_text(json.dumps(members, indent=2), encoding="utf-8")
+
+    def lines_for(self, t: datetime, path: str, node: dict | None, status: int, ms: float) -> list[str]:
+        rid = str(uuid.UUID(int=self.rng.getrandbits(128), version=4))
+        target = f"{node['ip']}:11434" if node else "cluster"
+        params = {"duration_ms": round(ms, 1), "id": rid, "method": "POST" if node else "GET",
+                  "node_id": node["uuid"] if node else "", "path": path, "status": status, "target": target,
+                  "ttfb_ms": round(ms * 0.35, 1)}
+        started = {k: params[k] for k in ("id", "method", "node_id", "path", "target")}
+        legacy = json.dumps({"jsonrpc": "2.0", "method": "ollama-proxy:proxy/request", "params": params})
+        start_t = t - timedelta(milliseconds=ms)
+        return [
+            json.dumps({"time": _iso(start_t), "level": "debug", "message": "ollama-proxy:proxy/request-started",
+                        "source": "pair", "sublevel": "proxy", "data": started}),
+            json.dumps({"time": _iso(t), "level": "info", "message": "ollama-proxy:proxy/request", "source": "pair",
+                        "sublevel": "proxy", "data": params}),
+            json.dumps({"time": _iso(t), "level": "info", "message": legacy, "source": "pair", "sublevel": "rpc"}),
+        ]
+
+    def poll_lines(self, t: datetime) -> list[str]:
+        out = []
+        for n in FAKE_NODES:
+            engines = [{"display_name": "Ollama", "engine": "ollama", "healthy": True, "installed": True, "port": 11434,
+                        "running": True}]
+            out.append(json.dumps({"time": _iso(t), "level": "debug", "message": f"remote engine status polled for {n['uuid']}",
+                                   "source": "pair", "sublevel": "engine", "data": {"engines": engines}}))
+        return out
+
+    def write_history(self, now: datetime) -> None:
+        """36 hours of busy and quiet periods; the older 24 hours go to the rotated file."""
+        rotated, current = [], []
+        t = now - timedelta(hours=36)
+        while t < now - timedelta(seconds=30):
+            busy = (t.hour % 6) in (1, 2)
+            gap = self.rng.uniform(4, 12) if busy else self.rng.uniform(60, 240)
+            t += timedelta(seconds=gap)
+            node = self.pick()
+            path = "/api/embed" if self.rng.random() < 0.25 else "/api/chat"
+            status = 503 if self.rng.random() < 0.02 else 200
+            ms = self.rng.uniform(900, 2600) * node["speed"] * (0.15 if path == "/api/embed" else 1)
+            lines = self.lines_for(t, path, node, status, ms)
+            if self.rng.random() < 0.05:
+                lines += self.lines_for(t, "/api/tags", None, 200, self.rng.uniform(20, 80))
+            if self.rng.random() < 0.1:
+                lines += self.poll_lines(t)
+            (rotated if t < now - timedelta(hours=12) else current).extend(lines)
+        for name, lines in (("nvpair.1.jsonl", rotated), ("nvpair.jsonl", current + self.poll_lines(now))):
+            (self.root / "logs" / name).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+
+    def pick(self) -> dict:
+        self.turn += 1
+        return FAKE_NODES[self.turn % len(FAKE_NODES)]
+
+    def record(self, path: str, status: int, ms: float) -> None:
+        with self.lock:
+            now = datetime.now(timezone.utc)
+            lines = self.lines_for(now, path, self.pick(), status, ms)
+            if time.monotonic() - self.last_poll > 30:
+                self.last_poll = time.monotonic()
+                lines += self.poll_lines(now)
+            with self.file.open("a", encoding="utf-8") as f:
+                f.write("".join(line + "\n" for line in lines))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "fake-pair/2"
 
@@ -179,6 +288,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid JSON"})
             return
         srv = self.server
+        began = time.monotonic()
         if srv.delay_s:
             time.sleep(srv.delay_s)
         with srv.lock:
@@ -188,6 +298,7 @@ class Handler(BaseHTTPRequestHandler):
                 srv.stats["failed"] += 1
         if fail:
             self._json(500, {"error": "fake PAIR: injected failure"})
+            self._log(500, began)
             return
         try:
             if kind == "embed":
@@ -196,8 +307,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"model": body.get("model"), "done": True, "done_reason": "stop",
                                  "message": {"role": "assistant", "content": json.dumps(answer_chat(body))}})
+            self._log(200, began)
         except (KeyError, IndexError, TypeError, ValueError) as e:
             self._json(400, {"error": f"fake PAIR cannot answer this: {e}"})
+            self._log(400, began)
+
+    def _log(self, status, began):
+        if self.server.pair_log:
+            try:
+                self.server.pair_log.record(self.path, status, (time.monotonic() - began) * 1000 + 1)
+            except OSError:
+                pass
 
 
 def exit_with_parent(pid):
@@ -211,11 +331,12 @@ def exit_with_parent(pid):
     os._exit(0)
 
 
-def make_server(port, delay_ms=0, fail_rate=0.0, seed=1):
+def make_server(port, delay_ms=0, fail_rate=0.0, seed=1, pair_dir=None):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     server.delay_s, server.fail_rate, server.rng = delay_ms / 1000, fail_rate, random.Random(seed)
     server.lock, server.stats = threading.Lock(), Counter(chat=0, embed=0, failed=0)
+    server.pair_log = FakePairLog(Path(pair_dir)) if pair_dir else None
     return server
 
 
@@ -225,8 +346,9 @@ def main(argv=None):
     ap.add_argument("--parent-pid", type=int)
     ap.add_argument("--delay-ms", type=int, default=0, help="wait this long before each chat or embed answer")
     ap.add_argument("--fail-rate", type=float, default=0.0, help="fraction of chat and embed requests that fail")
+    ap.add_argument("--pair-dir", help="keep a synthetic PAIR log and member list in this folder")
     args = ap.parse_args(argv)
-    server = make_server(args.port, args.delay_ms, args.fail_rate)
+    server = make_server(args.port, args.delay_ms, args.fail_rate, pair_dir=args.pair_dir)
     if args.parent_pid and os.name == "nt":
         threading.Thread(target=exit_with_parent, args=(args.parent_pid,), daemon=True).start()
     server.serve_forever()
