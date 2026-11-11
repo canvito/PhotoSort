@@ -6,13 +6,14 @@ import { PageErrorBoundary } from './components/ui.tsx';
 import { Icon } from './icons.tsx';
 import { JobsContext, useJobListSource } from './jobs.ts';
 import { ClusterPage } from './pages/Cluster.tsx';
+import { FacesPage } from './pages/Faces.tsx';
 import { GroupPage } from './pages/Group.tsx';
 import { JobPage } from './pages/Job.tsx';
 import { Overview } from './pages/Overview.tsx';
-import { Placeholder } from './pages/Placeholder.tsx';
 import { Privacy } from './pages/Privacy.tsx';
 import { RunPage, RunsPage } from './pages/Runs.tsx';
 import { SearchPage } from './pages/Search.tsx';
+import { SettingsPage } from './pages/Settings.tsx';
 import { SortPage } from './pages/Sort.tsx';
 
 export const NAV = [
@@ -139,12 +140,12 @@ export function App() {
             <Route path="/sort"><SortPage /></Route>
             <Route path="/group"><GroupPage /></Route>
             <Route path="/search"><SearchPage /></Route>
-            <Route path="/faces"><Placeholder page="faces" /></Route>
+            <Route path="/faces"><FacesPage /></Route>
             <Route path="/runs"><RunsPage /></Route>
             <Route path="/runs/:key">{(p) => <RunPage key={p.key} runKey={p.key} />}</Route>
             <Route path="/jobs/:id">{(p) => <JobPage key={p.id} id={p.id} />}</Route>
             <Route path="/cluster"><ClusterPage /></Route>
-            <Route path="/settings"><Placeholder page="settings" /></Route>
+            <Route path="/settings"><SettingsPage ctx={ctx} blur={blur} onBlur={setBlur} onProtection={() => void toggleProtection()} /></Route>
             <Route><div className="card"><h2>Not found</h2><p>This page does not exist. <Link href="/">Back to Overview</Link></p></div></Route>
           </Switch>
           </PageErrorBoundary>

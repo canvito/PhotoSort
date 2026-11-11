@@ -1,7 +1,7 @@
 // The opened item: a large preview (photos) or the video with Chromium's hardware decoding, falling back to the
 // 8-frame strip when the format cannot play; then caption, scene, objects, visible text, people and path.
 // Everything from the index is rendered as plain text. Cloud-only files are never downloaded.
-import { useState, type KeyboardEvent } from 'react';
+import { useState, type KeyboardEvent, type ReactNode, type Ref, type VideoHTMLAttributes } from 'react';
 import { api, errorText } from '../api.ts';
 import { bytes, mediaUrl, useDetail, type MediaItem } from '../gallery.ts';
 import { Icon } from '../icons.tsx';
@@ -13,7 +13,14 @@ function Strip({ item }: { item: MediaItem }) {
   return <img className="media viewer-strip" src={mediaUrl(item, 'strip')} alt="Frames from the video" draggable={false} onError={() => setFailed(true)} />;
 }
 
-function Viewer({ item }: { item: MediaItem }) {
+/** The large preview: a photo, a playable video (or its frames), or why it cannot be shown. `overlay` is drawn over
+ * a loaded photo or the playing video (it must scale the same way: fit inside the box, centred). */
+export function Viewer({ item, overlay, videoRef, videoEvents }: {
+  item: MediaItem;
+  overlay?: ReactNode;
+  videoRef?: Ref<HTMLVideoElement>;
+  videoEvents?: Pick<VideoHTMLAttributes<HTMLVideoElement>, 'onLoadedMetadata' | 'onPlay' | 'onSeeked'>;
+}) {
   const [frames, setFrames] = useState(false);
   const [videoFailed, setVideoFailed] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -48,6 +55,7 @@ function Viewer({ item }: { item: MediaItem }) {
           <img className={`media viewer-img${loaded ? ' loaded' : ''}`} src={mediaUrl(item, 'preview')} alt={item.name} draggable={false}
             onLoad={() => setLoaded(true)} onError={() => setFailed(true)} />
         )}
+        {loaded && !failed && overlay}
       </div>
     );
   }
@@ -56,9 +64,10 @@ function Viewer({ item }: { item: MediaItem }) {
     <>
       <div className={`viewer${strip ? ' natural' : ''}`}>
         {strip ? <Strip item={item} /> : (
-          <video className="media viewer-video" controls preload="metadata" poster={mediaUrl(item, 'thumb')} src={mediaUrl(item, 'original')}
-            onError={() => setVideoFailed(true)} />
+          <video ref={videoRef} className="media viewer-video" controls preload="metadata" poster={mediaUrl(item, 'thumb')} src={mediaUrl(item, 'original')}
+            onError={() => setVideoFailed(true)} {...videoEvents} />
         )}
+        {!strip && overlay}
       </div>
       <div className="viewer-bar">
         {videoFailed

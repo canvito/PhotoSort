@@ -1,5 +1,5 @@
 // Runs & Undo: every run in the journals of known folders (from the dashboard or a terminal alike), plus the
-// dashboard jobs that leave no run of their own (index, undo). A run opens with its files and its next steps.
+// dashboard jobs that leave no run of their own (index, undo, faces). A run opens with its files and its next steps.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'wouter';
 import {
@@ -14,7 +14,9 @@ import { jobTitle, useJobs } from '../jobs.ts';
 
 const n = (v: unknown): number => (typeof v === 'number' ? v : 0);
 const sum = (o: Record<string, number>): number => Object.values(o).reduce((a, b) => a + b, 0);
-const LABEL: Record<string, string> = { sort: 'Sort', group: 'Group', apply: 'Apply', index: 'Index', undo: 'Undo' };
+const LABEL: Record<string, string> = {
+  sort: 'Sort', group: 'Group', apply: 'Apply', index: 'Index', undo: 'Undo', faces: 'Face tagging', 'faces-setup': 'Face worker setup',
+};
 
 /** One short line about what a finished job did. */
 export function outcome(j: JobView): string {
@@ -26,13 +28,15 @@ export function outcome(j: JobView): string {
     case 'index': return `${n(s.captioned).toLocaleString()} described, ${n(s.unchanged).toLocaleString()} unchanged`;
     case 'undo': return `${n(s.restored).toLocaleString()} ${j.params.dryRun ? 'would move back' : 'moved back'}${n(s.problems) ? `, ${n(s.problems)} problems` : ''}`;
     case 'apply': return `${n(s.applied).toLocaleString()} ${j.params.action === 'copy' ? 'copied' : 'moved'}${n(s.changed) ? `, ${n(s.changed)} changed` : ''}`;
+    case 'faces': return `${n(s.matched).toLocaleString()} faces named, ${n(s.unknown).toLocaleString()} unknown`;
+    case 'faces-setup': return `${n(s.ready).toLocaleString()} of ${n(s.hosts).toLocaleString()} ready`;
   }
 }
 
 /** "Sort (move)", "Group preview", "Apply sort preview (copy)", "Undo preview", … */
 export function runTitle(r: RunRow): string {
   if (r.kind === 'undo') return r.action === 'preview' ? 'Undo preview' : 'Undo';
-  if (r.kind === 'index') return 'Index';
+  if (r.kind === 'index' || r.kind === 'faces' || r.kind === 'faces-setup') return LABEL[r.kind];
   if (r.kind === 'apply') return `Apply${r.of ? ` ${r.of}` : ''} preview (${r.action ?? 'move'})`;
   const k = LABEL[r.kind] ?? r.kind;
   return r.action === 'report' ? `${k} preview` : r.action ? `${k} (${r.action})` : k;
@@ -89,11 +93,12 @@ function useRunList() {
   return res;
 }
 
-type KindFilter = '' | 'sort' | 'group' | 'apply' | 'index' | 'undo';
+type KindFilter = '' | 'sort' | 'group' | 'apply' | 'index' | 'undo' | 'faces';
 type OriginFilter = '' | 'dashboard' | 'terminal';
 const KINDS: { value: KindFilter; label: string }[] = [
   { value: '', label: 'All' }, { value: 'sort', label: 'Sort' }, { value: 'group', label: 'Group' },
   { value: 'apply', label: 'Apply' }, { value: 'index', label: 'Index' }, { value: 'undo', label: 'Undo' },
+  { value: 'faces', label: 'Faces' },
 ];
 const ORIGINS: { value: OriginFilter; label: string }[] = [
   { value: '', label: 'Anywhere' }, { value: 'dashboard', label: 'Dashboard' }, { value: 'terminal', label: 'Terminal' },
@@ -216,7 +221,7 @@ export function RunsPage() {
             })}
           </div>
         )}
-        <p className="muted small">Runs from every listed folder’s journal, newest first, plus the dashboard’s index and undo jobs.
+        <p className="muted small">Runs from every listed folder’s journal, newest first, plus the dashboard’s index, undo and face jobs.
           Durations marked ≈ come from the journal (whole seconds).</p>
       </section>
       {data && <Folders folders={data.folders} reload={reload} />}

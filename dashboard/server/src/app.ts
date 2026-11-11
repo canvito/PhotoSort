@@ -6,14 +6,16 @@ import { installSecurity, requireAuthClass, type AuthClass } from './security.ts
 import { SseHub } from './sse.ts';
 import { pairHealth } from './health.ts';
 import { DirRegistry } from './dirs.ts';
-import { JobManager } from './jobs.ts';
+import { FACE_WORKER_ENV, JobManager } from './jobs.ts';
 import { registerJobRoutes } from './routes.ts';
+import { registerFaceRoutes } from './faces.ts';
 import { cachedProbe } from './pyinfo.ts';
 import { Sidecar } from './sidecar.ts';
 import { registerGalleryRoutes } from './gallery.ts';
 import { registerRunRoutes } from './runs.ts';
 import { registerPairRoutes } from './cluster.ts';
 import { registerPrivacyRoutes } from './privacy.ts';
+import { registerSettingsRoutes } from './settings.ts';
 import type { PairLog } from './pairlog.ts';
 
 declare module 'fastify' {
@@ -94,16 +96,22 @@ export async function buildApp(opts: AppOptions): Promise<App> {
   const jobs = new JobManager({
     dataDir: opts.dataDir, python: opts.python, photosortDir: opts.photosortDir, configPath: opts.configPath, hub,
     log: opts.logger, script: opts.jobScript, isOurProcess: opts.isOurProcess,
+    // Fixture face jobs use the stand-in worker, which reads the test pictures' colour codes (no model, no network).
+    env: opts.mode === 'fixture' ? { [FACE_WORKER_ENV]: path.join(opts.photosortDir, 'tests', 'fake_face_worker.py') } : undefined,
   });
   await jobs.init();
   registerJobRoutes(app, jobs, dirs);
   const sidecar = new Sidecar({ ...opts, hub });
   registerGalleryRoutes(app, sidecar, dirs);
+  registerFaceRoutes(app, sidecar, dirs);
   await registerRunRoutes(app, opts.dataDir, dirs, jobs, sidecar);
   const pair = registerPairRoutes(app, {
     pairDir: opts.pairDir ?? path.join(opts.dataDir, 'pair'), configPath: opts.configPath, hub, selfName: opts.selfName,
   });
   registerPrivacyRoutes(app, { configPath: opts.configPath, dataDir: opts.dataDir, pair, jobs, sidecar, listConnections: opts.listConnections });
+  registerSettingsRoutes(app, {
+    configPath: opts.configPath, python: opts.python, photosortDir: opts.photosortDir, fixture: opts.mode === 'fixture', sidecar,
+  });
   const pythonInfo = cachedProbe(opts.python, opts.photosortDir);
 
   app.get('/healthz', { config: { auth: 'public' } }, async () => ({ ok: true, version: opts.version, mode: opts.mode }));

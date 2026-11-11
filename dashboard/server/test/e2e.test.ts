@@ -15,6 +15,7 @@ import { findPython, photosortDir, RecordingHub, until } from './helpers.ts';
 const PY = findPython();
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'psdash-e2e-'));
 const lib = path.join(tmp, 'library');
+const people = path.join(tmp, 'people'); // make_fixtures puts the reference portraits beside the library
 const PHOTOS = 24;
 const MEDIA = PHOTOS + 2; // make_fixtures adds two clips
 const TOKEN = 'e'.repeat(43);
@@ -136,7 +137,7 @@ describe('dashboard jobs against the real CLI and fake PAIR', () => {
     host = `127.0.0.1:${port}`;
     built = await buildApp({
       port, token: TOKEN, mode: 'fixture', version: 'e2e', configPath, dataDir: path.join(tmp, 'app'), python: PY, photosortDir,
-      fixtureRoots: [lib], shutdownWaitMs: 10000, onShutdown: () => undefined,
+      fixtureRoots: [lib, people], shutdownWaitMs: 10000, onShutdown: () => undefined,
     });
     await built.app.listen({ host: '127.0.0.1', port });
     await new Promise<void>((resolve, reject) => {
@@ -307,6 +308,52 @@ describe('dashboard jobs against the real CLI and fake PAIR', () => {
     expect(((await get('/api/runs')).body.runs as Row[]).some((r) => r.runId === rid)).toBe(false);
     rmSync(other, { recursive: true });
   }, 60000);
+
+  it('tags faces with the stand-in worker (fixture mode never contacts another PC), and the Faces API reads the results', async () => {
+    const get = async (url: string) => {
+      const r = await built.app.inject({ url, headers: auth() });
+      return { status: r.statusCode, body: r.json() as Record<string, any> };
+    };
+    const S = built.dirs.idFor(lib);
+    const P = built.dirs.idFor(people);
+    expect((await get(`/api/faces?folder=${S}`)).status).toBe(404);
+    const start = (params: Record<string, unknown>, kind = 'faces') => post('/api/jobs', { kind, params });
+    expect((await start({ source: P, people: P })).status).toBe(400);
+    expect((await start({ source: S, people: P, workers: 'local;calc' })).status).toBe(400);
+    expect((await start({ source: S, people: P, workers: 'local:2,lan-box:4' })).status).toBe(403);
+    expect((await start({ hosts: ['lan-box'] }, 'faces-setup')).status).toBe(403);
+
+    const job = await run('faces', { source: S, people: P, workers: 'local:2' });
+    expect(job.status, JSON.stringify(job)).toBe('ok');
+    expect(job.summary).toMatchObject({ images: PHOTOS, videos: 2, errors: 0 });
+    expect(total(job.counts)).toBe(MEDIA);
+    expect(job.counts.named).toBeGreaterThan(0);
+    expect(job.counts['no faces']).toBeGreaterThan(0);
+    await until(() => seen.some((s) => s.data.job === job.id && s.data.type === 'progress' && s.data.phase === 'detect'), 5000,
+      'detection progress on the page');
+
+    const read = (await get(`/api/faces?folder=${S}`)).body;
+    expect(read.counts.all).toBe(MEDIA);
+    expect(Object.keys(read.counts.people).sort()).toEqual(['Alice', 'Bob']);
+    expect(read).toMatchObject({ people: ['Alice', 'Bob'], provider: expect.any(String), summary: { errors: 0 } });
+    const alice = (await get(`/api/faces/items?folder=${S}&filter=person:Alice&limit=500`)).body;
+    expect(alice.total).toBe(read.counts.people.Alice);
+    expect(new Set(alice.items.map((i: { kind: string }) => i.kind))).toEqual(new Set(['photo', 'video']));
+    const photo = alice.items.find((i: { kind: string }) => i.kind === 'photo');
+    const detail = (await get(`/api/faces/items/${photo.id}?folder=${S}`)).body;
+    expect(detail.detections.length).toBe(photo.faces);
+    expect(detail.width).toBeGreaterThan(0);
+    expect(detail.detections.some((d: { person: string }) => d.person === 'Alice')).toBe(true);
+    expect((await built.app.inject({ url: `/media/${photo.id}/thumb?v=${photo.revision}`, headers: auth() })).statusCode).toBe(200);
+    expect((await get(`/api/faces/items?folder=${S}&filter=person:..%5Cx`)).status).toBe(400);
+
+    const ppl = (await get(`/api/faces/people?dir=${P}`)).body;
+    expect(ppl.people.map((p: { name: string }) => p.name)).toEqual(['Alice', 'Bob']);
+    expect(ppl.people.every((p: { count: number; samples: unknown[] }) => p.count > 0 && p.samples.length > 0)).toBe(true);
+    expect((await get('/api/faces/workers')).body).toMatchObject({ effective: ['local'], fixture: true });
+    const checked = await post('/api/faces/check-workers', { workers: 'local:2,lan-box' });
+    expect(checked.body).toMatchObject({ workers: [{ host: 'local', state: 'ready' }, { host: 'lan-box', state: 'skipped' }] });
+  }, 300000);
 
   it('stops safely: every moved file is journaled and nothing is lost or half-moved', async () => {
     const slow = await startFakePair(150);

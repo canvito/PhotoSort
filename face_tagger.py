@@ -23,13 +23,14 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import runctl
 from face_worker import PROTOCOL, FaceTaggingError, InsightFaceBackend, decode_embedding, read_frame, write_frame
 from media import VideoError, frame_pngs, video_targets
 
@@ -48,6 +49,10 @@ REQUEST_TIMEOUT_S = 300
 SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
 _HOST_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+# The dashboard's fixture mode points this at tests\fake_face_worker.py, which answers from colour codes in
+# synthetic pictures instead of running InsightFace. Only the `local` worker uses it.
+WORKER_ENV = "PHOTOSORT_FACE_WORKER"
+PROGRESS_INTERVAL_S = 0.25
 
 log = logging.getLogger("photosort")
 
@@ -355,7 +360,10 @@ def start_worker(spec: WorkerSpec, model: str = "buffalo_l", model_dir: Path | N
                  ready_timeout: float = READY_TIMEOUT_S) -> WorkerConnection:
     """Start a worker; SSH workers get the current face_worker.py deployed when theirs is missing or stale."""
     if spec.is_local:
-        command = [sys.executable, "-u", str(WORKER_FILE), "--threads", str(spec.threads), "--model", model]
+        script = Path(os.environ.get(WORKER_ENV) or WORKER_FILE)
+        if not script.is_file():
+            raise WorkerDied(f"local: face worker script not found: {script} (from {WORKER_ENV})")
+        command = [sys.executable, "-u", str(script), "--threads", str(spec.threads), "--model", model]
         if model_dir:
             command += ["--model-dir", str(model_dir)]
         return WorkerConnection.spawn("local", command, spec.threads, ready_timeout)
@@ -502,9 +510,30 @@ def _file_size(path) -> int:
         return 0
 
 
-def _run_all(jobs: list, threads: int, fn, cost=None, label: str = "") -> list[tuple[object, Exception | None]]:
-    """fn(job) for every job on `threads` threads, costliest first; returns (result, error) in input order."""
+class _Progress:
+    """A run step for the dashboard: a `phase` event now, then `progress` events at most 4 a second (and the last
+    one always). Without --events both are no-ops."""
+
+    def __init__(self, phase: str, total: int):
+        self.phase, self.total, self.last = phase, total, 0.0
+        self.lock = threading.Lock()
+        runctl.emit("phase", name=phase, total=total)
+
+    def __call__(self, done: int) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if done < self.total and now - self.last < PROGRESS_INTERVAL_S:
+                return
+            self.last = now
+        runctl.emit("progress", phase=self.phase, done=done, total=self.total)
+
+
+def _run_all(jobs: list, threads: int, fn, cost=None, label: str = "",
+             progress=None) -> list[tuple[object, Exception | None]]:
+    """fn(job) for every job on `threads` threads, costliest first; returns (result, error) in input order.
+    A cancel (runctl) stops it before the next job starts; progress(done) is called as jobs finish."""
     def one(job):
+        runctl.checkpoint()
         try:
             return fn(job), None
         except NoWorkersLeft:
@@ -513,15 +542,22 @@ def _run_all(jobs: list, threads: int, fn, cost=None, label: str = "") -> list[t
             return None, e
 
     if threads <= 1 or len(jobs) < 2:
-        return [one(job) for job in jobs]
+        results = []
+        for job in jobs:
+            results.append(one(job))
+            if progress:
+                progress(len(results))
+        return results
     results: list = [None] * len(jobs)
     step = max(25, len(jobs) // 10)
     order = sorted(range(len(jobs)), key=lambda i: cost(jobs[i]), reverse=True) if cost else range(len(jobs))
     ex = ThreadPoolExecutor(min(threads, len(jobs)))
     futures = {ex.submit(one, jobs[i]): i for i in order}
     try:
-        for count, future in enumerate(as_completed(futures), 1):
+        for count, future in enumerate(runctl.completed(futures), 1):
             results[futures[future]] = future.result()
+            if progress:
+                progress(count)
             if label and (count % step == 0 or count == len(jobs)):
                 log.info("%s: %d/%d jobs", label, count, len(jobs))
     except BaseException:
@@ -535,10 +571,10 @@ def _concurrency(backend) -> int:
     return max(1, int(getattr(backend, "concurrency", 1)))
 
 
-def _detect_all(backend, paths: list[Path], label: str = "") -> list[tuple[list | None, Exception | None]]:
+def _detect_all(backend, paths: list[Path], label: str = "", progress=None) -> list[tuple[list | None, Exception | None]]:
     """Run backend.detect on every path, in parallel when the backend supports it; keeps input order.
     Largest files go first so one big job doesn't run alone at the end."""
-    return _run_all(paths, _concurrency(backend), backend.detect, _file_size, label)
+    return _run_all(paths, _concurrency(backend), backend.detect, _file_size, label, progress)
 
 
 def _reference_people(people_dir: Path, image_exts: set[str], backend) -> dict[str, list[float]]:
@@ -553,7 +589,9 @@ def _reference_people(people_dir: Path, image_exts: set[str], backend) -> dict[s
     if not references:
         raise FaceTaggingError(f"no person subfolders found under {people_dir}")
     vectors: dict[Path, list[list[float]]] = {}
-    for (folder, path), (faces, error) in zip(references, _detect_all(backend, [p for _, p in references])):
+    paths = [p for _, p in references]
+    for (folder, path), (faces, error) in zip(references, _detect_all(backend, paths, "",
+                                                                      _Progress("references", len(paths)))):
         if error is not None:
             raise FaceTaggingError(f"cannot read reference image {path}: {error}") from error
         if len(faces) != 1:
@@ -624,7 +662,9 @@ def _detect_media(backend, paths: list[Path], video_exts, label: str = "faces") 
     videos = [p for p in paths if p.suffix.lower() in video_exts]
     found = {}
     jobs = [(p, None) for p in paths if p.suffix.lower() not in video_exts]
-    for path, (picks, error) in zip(videos, _run_all(videos, threads, lambda p: video_targets(p, None))):
+    sampled = _run_all(videos, threads, lambda p: video_targets(p, None), progress=_Progress("videos", len(videos))
+                       if videos else None)
+    for path, (picks, error) in zip(videos, sampled):
         if error is not None:
             found[path] = (None, error)
             continue
@@ -640,7 +680,7 @@ def _detect_media(backend, paths: list[Path], video_exts, label: str = "faces") 
         return [(seconds, backend.detect(png)) for seconds, png in pngs]
 
     try:
-        done = _run_all(jobs, threads, run, lambda job: _file_size(job[0]), label)
+        done = _run_all(jobs, threads, run, lambda job: _file_size(job[0]), label, _Progress("detect", len(jobs)))
     finally:
         if procs:
             procs.shutdown()
@@ -703,6 +743,7 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
     specs = parse_workers(workers)
     owned = backend is None
     if owned:
+        runctl.emit("phase", name="workers")
         backend = WorkerPool.start(specs, model, model_dir)
     try:
         people = _reference_people(people_dir, image_exts, backend)
@@ -713,7 +754,8 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
 
     records, face_count, matched_count, unknown_count, errors = [], 0, 0, 0, 0
     frame_count = 0
-    for path, (found, error) in zip(paths, detected):
+    runctl.emit("phase", name="match", total=len(paths))
+    for n, (path, (found, error)) in enumerate(zip(paths, detected), 1):
         record = {"file": str(path.relative_to(source))}
         video = path.suffix.lower() in video_exts
         if video:
@@ -729,6 +771,7 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
         except (OSError, RuntimeError, ValueError, TypeError) as e:
             errors += 1
             records.append({**record, "error": f"{type(e).__name__}: {str(e)[:200]}"})
+            runctl.emit("item", phase="match", n=n, total=len(paths), path=str(path), error=records[-1]["error"])
             continue
         face_count += len(tagged)
         matched_count += sum(face["person"] is not None for face in tagged)
@@ -739,6 +782,10 @@ def tag_people(source: Path, people_dir: Path, output: Path | None, image_exts: 
             seen = Counter(name for _, name in {(f["time_s"], f["person"]) for f in tagged if f["person"]})
             record.update(frames=found["frames"], people=dict(seen.most_common()))
         records.append({**record, "faces": tagged})
+        named = sorted({f["person"] for f in tagged if f["person"]})
+        status = "named" if named else "unknown faces" if tagged else "no faces"
+        runctl.emit("item", phase="match", n=n, total=len(paths), path=str(path),
+                    result={"status": status, "faces": len(tagged), "people": named})
     videos = sum(path.suffix.lower() in video_exts for path in paths)
 
     finished_at = datetime.now()

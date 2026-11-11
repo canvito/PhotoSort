@@ -30,7 +30,7 @@ def main() -> int:
             items = int(r.split("=", 1)[1])
         elif r.startswith("--delay="):
             delay = float(r.split("=", 1)[1])
-    print(json.dumps({"argv": rest}), flush=True)
+    print(json.dumps({"argv": rest, "face_worker": os.environ.get("PHOTOSORT_FACE_WORKER")}), flush=True)
     if "--crash" in rest:
         print("Traceback (most recent call last):\nValueError: the fake crashed", file=sys.stderr, flush=True)
         return 2

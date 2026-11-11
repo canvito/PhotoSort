@@ -55,7 +55,7 @@ export interface DirListing extends DirInfo {
   truncated: boolean;
 }
 
-export type JobKind = 'sort' | 'group' | 'index' | 'undo' | 'apply';
+export type JobKind = 'sort' | 'group' | 'index' | 'undo' | 'apply' | 'faces' | 'faces-setup';
 export type JobStatus = 'queued' | 'running' | 'cancelling' | 'ok' | 'errors' | 'failed' | 'cancelled' | 'interrupted' | 'removed';
 export const ACTIVE: ReadonlySet<JobStatus> = new Set(['queued', 'running', 'cancelling']);
 
@@ -311,6 +311,27 @@ export interface PairEvent {
   alert?: PairAlert;
 }
 
+/** GET /api/config: config.json as it is on disk, and the models PAIR offers (names only). */
+export interface ConfigReply {
+  config: Record<string, unknown> | null;
+  parseError?: string;
+  etag: string;
+  file: string;
+  fixture: boolean;
+  pairReachable: boolean;
+  models: { name: string; cloud: boolean; size?: number; params?: string; family?: string }[];
+}
+
+/** PUT /api/config: the result of checking (and, with save, saving) a config. */
+export interface ConfigCheck {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  changes: { key: string; before?: string; after?: string }[];
+  saved: boolean;
+  etag: string;
+}
+
 declare global {
   interface Window {
     photosort?: {
@@ -328,7 +349,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, init?: { method?: 'POST' | 'DELETE'; body?: unknown; signal?: AbortSignal }): Promise<T> {
+export async function api<T>(path: string, init?: { method?: 'POST' | 'PUT' | 'DELETE'; body?: unknown; signal?: AbortSignal }): Promise<T> {
   const r = await fetch(path, {
     method: init?.method ?? 'GET',
     headers: init?.body === undefined ? undefined : { 'content-type': 'application/json' },

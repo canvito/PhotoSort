@@ -36,9 +36,11 @@ export class Sidecar {
     this.proc = proc;
     // Never copy interpreter/decoder stderr into logs: a native error can include a media path.
     proc.stderr.resume();
-    proc.stdin.on('error', () => this.fail('unavailable'));
+    proc.stdin.on('error', () => { if (this.proc === proc) this.fail('unavailable'); });
     const lines = createInterface({ input: proc.stdout });
     lines.on('line', (line) => {
+      // After a restart, the old helper's last words must not touch the new one's calls.
+      if (this.proc !== proc) return;
       try {
         const msg = JSON.parse(line) as { id?: number; result?: unknown; error?: { code?: string }; method?: string; params?: unknown };
         if (msg.method === 'index') { o.hub.send('index', msg.params); return; }
@@ -84,21 +86,35 @@ export class Sidecar {
 
   get pid(): number | undefined { return this.proc?.pid; }
 
+  /** Stops the helper so the next call starts a fresh one, which reads config.json again. */
+  async restart(): Promise<void> {
+    const proc = this.proc;
+    this.proc = undefined;
+    this.retryAt = 0;
+    this.fail('restarting');
+    if (proc) await stopProcess(proc);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     this.fail('closed');
     const proc = this.proc;
-    if (!proc || proc.exitCode !== null) return;
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        if (proc.exitCode === null && proc.pid) {
-          if (process.platform === 'win32') {
-            execFile('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true }, () => resolve());
-          } else { proc.kill(); resolve(); }
-        } else resolve();
-      }, 2500);
-      proc.once('exit', () => { clearTimeout(timer); resolve(); });
-      proc.stdin.end(JSON.stringify({ jsonrpc: '2.0', method: 'sys.shutdown' }) + '\n');
-    });
+    if (proc) await stopProcess(proc);
   }
+}
+
+/** Asks the helper to finish, then ends its process tree if it has not exited 2.5 s later. */
+async function stopProcess(proc: ChildProcessWithoutNullStreams): Promise<void> {
+  if (proc.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      if (proc.exitCode === null && proc.pid) {
+        if (process.platform === 'win32') {
+          execFile('taskkill.exe', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true }, () => resolve());
+        } else { proc.kill(); resolve(); }
+      } else resolve();
+    }, 2500);
+    proc.once('exit', () => { clearTimeout(timer); resolve(); });
+    proc.stdin.end(JSON.stringify({ jsonrpc: '2.0', method: 'sys.shutdown' }) + '\n');
+  });
 }

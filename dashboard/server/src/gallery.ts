@@ -24,9 +24,11 @@ const ERRORS: Record<string, [number, string]> = {
   undecodable: [422, 'A preview could not be decoded.'],
   busy: [409, 'Preview work is in progress. Try again shortly.'],
   timeout: [504, 'Local processing timed out. Try again.'],
+  no_results: [404, 'No face results in this folder yet. Run face tagging on it first.'],
+  bad_results: [422, 'The face results file in this folder could not be read. Run face tagging again.'],
 };
 
-function error(reply: FastifyReply, e: unknown): FastifyReply {
+export function error(reply: FastifyReply, e: unknown): FastifyReply {
   if (e instanceof DirError) return reply.code(e.status).send({ error: e.message });
   const [status, message] = e instanceof SidecarError ? ERRORS[e.code] ?? [503, 'The local library service is unavailable. Try again.']
     : [500, 'Could not read this local file. Refresh and try again.'];

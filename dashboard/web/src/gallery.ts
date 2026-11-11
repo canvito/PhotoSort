@@ -12,7 +12,8 @@ export interface MediaItem {
   folder: string;
   kind: 'photo' | 'video';
   size: number;
-  indexed_at: string;
+  /** Null for files outside the index (face results list any file they found). */
+  indexed_at: string | null;
   people_count: number;
   exists: boolean;
   /** Cloud-only (OneDrive Files On-Demand): the dashboard never downloads it. */
@@ -22,6 +23,7 @@ export interface MediaItem {
 }
 
 export interface MediaDetail extends MediaItem {
+  indexed_at: string;
   path: string;
   caption: string;
   scene: string;
@@ -108,6 +110,10 @@ export interface Browse extends GallerySource {
   retry(): void;
 }
 
+export interface Paged<T extends MediaItem> extends Browse {
+  get(i: number): T | undefined;
+}
+
 interface BrowseState {
   key: string;
   ctrl: AbortController;
@@ -128,9 +134,19 @@ const freshState = (key: string): BrowseState => ({
  * in a reply (the parent then bumps `generation`). Nothing is fetched until `enabled`. */
 export function useBrowse(params: BrowseParams, generation: number | undefined, enabled: boolean,
   onGeneration: (g: number) => void): Browse {
+  const query: Record<string, string> = { sort: params.sort, media: params.media };
+  if (params.dir) query.dir = params.dir;
+  return usePaged<MediaItem>('/api/index/items', query, generation, enabled, onGeneration);
+}
+
+/** Any paged list the server answers with `{items, total, generation}` (the index, face results), loaded the
+ * same way as the index browse: by page, for the visible range only, dropped when the generation changes. */
+export function usePaged<T extends MediaItem>(endpoint: string, query: Record<string, string>, generation: number | undefined,
+  enabled: boolean, onGeneration: (g: number) => void): Paged<T> {
   const [version, bump] = useReducer((x: number) => x + 1, 0);
   const [epoch, setEpoch] = useState(0);
-  const key = JSON.stringify([params.sort, params.media, params.dir ?? '', generation ?? -1, epoch]);
+  const queryKey = JSON.stringify([endpoint, Object.entries(query).sort()]);
+  const key = JSON.stringify([queryKey, generation ?? -1, epoch]);
   const st = useRef<BrowseState>(freshState(key));
   // A new key drops the old pages at once (no frame of old items under new filters); the abort is idempotent.
   if (st.current.key !== key) {
@@ -142,9 +158,9 @@ export function useBrowse(params: BrowseParams, generation: number | undefined, 
 
   const fetchPage = useCallback((s: BrowseState, page: number) => {
     s.inflight.add(page);
-    const q = new URLSearchParams({ cursor: String(page * BROWSE_PAGE), limit: String(BROWSE_PAGE), sort: params.sort, media: params.media });
-    if (params.dir) q.set('dir', params.dir);
-    api<ItemsPage>(`/api/index/items?${q}`, { signal: s.ctrl.signal })
+    const [url, entries] = JSON.parse(queryKey) as [string, [string, string][]];
+    const q = new URLSearchParams([...entries, ['cursor', String(page * BROWSE_PAGE)], ['limit', String(BROWSE_PAGE)]]);
+    api<ItemsPage>(`${url}?${q}`, { signal: s.ctrl.signal })
       .then((r) => {
         if (st.current !== s) return;
         if (s.gen !== undefined && r.generation !== s.gen) {
@@ -169,7 +185,7 @@ export function useBrowse(params: BrowseParams, generation: number | undefined, 
         s.inflight.delete(page);
         if (st.current === s) bump();
       });
-  }, [params.sort, params.media, params.dir, generation]);
+  }, [queryKey, generation]);
 
   // The first page gives the total; the grid asks for the rest as it scrolls. Pages stay while the tab is hidden.
   useEffect(() => {
@@ -196,7 +212,7 @@ export function useBrowse(params: BrowseParams, generation: number | undefined, 
   // `version` changes whenever a page lands, so the grid re-renders with the new items.
   return useMemo(() => ({
     count: s.total ?? 0,
-    get: (i: number) => s.pages.get(Math.floor(i / BROWSE_PAGE))?.[i % BROWSE_PAGE],
+    get: (i: number) => s.pages.get(Math.floor(i / BROWSE_PAGE))?.[i % BROWSE_PAGE] as T | undefined,
     ensure,
     loading: s.total === undefined && !s.error,
     error: s.error,

@@ -11,7 +11,7 @@ import { open, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { SseHub } from './sse.ts';
 
-export const JOB_KINDS = ['sort', 'group', 'index', 'undo', 'apply'] as const;
+export const JOB_KINDS = ['sort', 'group', 'index', 'undo', 'apply', 'faces', 'faces-setup'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 export type JobStatus = 'queued' | 'running' | 'cancelling' | 'ok' | 'errors' | 'failed' | 'cancelled' | 'interrupted' | 'removed';
 const TERMINAL: ReadonlySet<JobStatus> = new Set(['ok', 'errors', 'failed', 'cancelled', 'interrupted', 'removed']);
@@ -22,6 +22,7 @@ const KEEP_JOBS = 1000;
 const ITEM_BATCH = 50;
 const ITEM_FLUSH_MS = 250;
 const POLL_MS = 100;
+export const FACE_WORKER_ENV = 'PHOTOSORT_FACE_WORKER';
 
 export interface JobMessage {
   level: 'warning' | 'error';
@@ -93,6 +94,8 @@ export interface JobManagerOptions {
   log?: { info(o: object): void; error(o: object): void };
   /** Tests point this at a stand-in script; the default is photosort.py. */
   script?: string;
+  /** Extra environment for job processes (fixture mode: the stand-in face worker). */
+  env?: Record<string, string>;
   /** Tests: how a reattached process is checked (default: its command line names the job). */
   isOurProcess?: (pid: number, jobId: string) => Promise<boolean>;
 }
@@ -423,6 +426,13 @@ export class JobManager {
     else this.pump();
   }
 
+  /** A stand-in face worker is only ever used when this dashboard asks for one (fixture mode), never inherited. */
+  private jobEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' };
+    for (const k of Object.keys(env)) if (k.toUpperCase() === FACE_WORKER_ENV) delete env[k];
+    return { ...env, ...this.opts.env };
+  }
+
   private start(rec: JobRecord): void {
     const dir = this.jobDir(rec.id);
     const out = openSync(path.join(dir, 'stdout.txt'), 'a');
@@ -437,7 +447,7 @@ export class JobManager {
         windowsHide: true,
         shell: false,
         detached: true,
-        env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
+        env: this.jobEnv(),
       });
     } catch (e) {
       closeSync(out);
@@ -542,6 +552,14 @@ export class JobManager {
           ?? str(r.status) ?? (str(r.from) ? 'restored' : str(r.dst) ? 'applied' : undefined);
         if (bucket && !item.error) rec.counts[bucket] = (rec.counts[bucket] ?? 0) + 1;
         if (live) lv.pending.push(item);
+        break;
+      }
+      case 'progress': {
+        // Steps that report counts rather than files (face detection, reference photos, video sampling).
+        if (str(ev.phase) !== rec.phase) break;
+        rec.done = Math.max(rec.done, num(ev.done) ?? 0);
+        rec.total = num(ev.total) ?? rec.total;
+        if (live) this.send(rec, 'progress', {});
         break;
       }
       case 'understood':

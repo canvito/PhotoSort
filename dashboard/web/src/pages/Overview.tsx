@@ -1,3 +1,4 @@
+import { Link } from 'wouter';
 import { duration, type PairHealth, type PythonInfo } from '../api.ts';
 import type { Ctx } from '../App.tsx';
 import { RecentJobs } from '../components/forms.tsx';
@@ -56,12 +57,23 @@ const FEATURES: [string, string][] = [
   ['webgl2', 'WebGL 2'],
 ];
 
+const PAGES: [string, string, string][] = [
+  ['/sort', 'Sort', 'Put photos and videos into category folders, with a preview first.'],
+  ['/group', 'Group', 'Gather what a sentence describes, like a birthday party last Sunday, into one folder.'],
+  ['/search', 'Search', 'Find indexed photos and videos by describing them.'],
+  ['/faces', 'Faces', 'Tag the people you name across your photos.'],
+  ['/runs', 'Runs & Undo', 'Every run, including ones started from a terminal, with undo.'],
+  ['/cluster', 'Cluster', 'Which machines serve the models and how busy they are.'],
+  ['/settings', 'Settings', 'Models, buckets and speed, checked before they are saved.'],
+  ['/privacy', 'Privacy', 'Live checks that your media only goes to machines on your network.'],
+];
+
 export function Overview({ ctx, reloadHealth }: { ctx: Ctx; reloadHealth(): void }) {
   const { meta, shell } = ctx;
   return (
     <div className="grid">
       <PairCard pair={ctx.pair} error={ctx.pairError} reload={reloadHealth} />
-      <RecentJobs kinds={['sort', 'group', 'index', 'undo', 'apply']} />
+      <RecentJobs kinds={['sort', 'group', 'index', 'faces', 'undo', 'apply']} />
       <PythonCard py={ctx.python} />
       <section className="card">
         <h2>Dashboard</h2>
@@ -91,12 +103,9 @@ export function Overview({ ctx, reloadHealth }: { ctx: Ctx; reloadHealth(): void
         ) : <p className="muted">Open the dashboard with dashboard.ps1 to see hardware acceleration.</p>}
       </section>
       <section className="card">
-        <h2>Coming next</h2>
-        <ul className="plain">
-          <li><b>P1 ✓</b> Sort, Group and Index jobs with live progress, safe stop, apply-preview and undo</li>
-          <li><b>P2 ✓</b> Search and a fast gallery with thumbnails and video playback</li>
-          <li><b>P3 ✓</b> Runs history (terminal runs too), PAIR cluster view and the live privacy audit</li>
-          <li><b>P4</b> Faces, settings editor and polish</li>
+        <h2>What you can do here</h2>
+        <ul className="plain pages">
+          {PAGES.map(([href, label, what]) => <li key={href}><Link href={href}>{label}</Link><span className="muted">{what}</span></li>)}
         </ul>
       </section>
     </div>

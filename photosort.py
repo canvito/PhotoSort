@@ -10,6 +10,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import sys
@@ -26,9 +27,9 @@ from PIL import Image, ImageOps
 
 import group
 import runctl
-from face_tagger import FaceTaggingError, format_face_report, setup_remote_worker, tag_people
+from face_tagger import FaceTaggingError, format_face_report, parse_workers, setup_remote_worker, tag_people
 from index_transfer import export_index, format_export_report, format_import_report, import_index
-from local_only import LocalOnlyError, require_local_models, require_loopback
+from local_only import LocalOnlyError, require_local_models, require_loopback, under_onedrive
 from media import VIDEO_EXTS, VideoError, encode_pil, is_video, video_jpegs
 from photo_search import (PairSearchClient, SearchError, index_folder, index_path, search_index, settings,
                           sha256_file, update_index_paths)
@@ -63,6 +64,88 @@ def load_config(path: Path) -> dict:
     if "other" not in cfg["buckets"]:
         raise ValueError("config buckets must include 'other'")
     return cfg
+
+
+BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {f"{p}{i}" for p in ("com", "lpt") for i in range(1, 10)}
+CONFIG_INTS = {"concurrency": (1, 64), "index_concurrency": (1, 64), "max_side": (256, 4096), "retries": (1, 10)}
+
+
+def config_problems(cfg) -> dict:
+    """Why a config cannot be saved (`errors`) and what deserves a second look (`warnings`). Stricter than
+    load_config, which keeps accepting older hand-edited files: the dashboard's Settings page saves only clean ones."""
+    if not isinstance(cfg, dict):
+        return {"errors": ["The config must be a JSON object."], "warnings": []}
+    errors, warnings = [], []
+    try:
+        require_loopback(str(cfg.get("base_url") or ""))
+    except LocalOnlyError as e:
+        errors.append(str(e))
+    for key in ("model", "caption_model", "embed_model"):
+        name = cfg.get(key)
+        if name is None and key != "model":
+            continue
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{key} must be a model name.")
+            continue
+        try:
+            require_local_models([name])
+        except LocalOnlyError as e:
+            errors.append(str(e))
+    for key, (lo, hi) in CONFIG_INTS.items():
+        value = cfg.get(key)
+        if value is None and key == "index_concurrency":
+            continue
+        if type(value) is not int or not lo <= value <= hi:
+            errors.append(f"{key} must be a whole number from {lo} to {hi}.")
+    timeout = cfg.get("timeout_s")
+    if type(timeout) not in (int, float) or not 5 <= timeout <= 3600:
+        errors.append("timeout_s must be a number of seconds from 5 to 3600.")
+    if cfg.get("action") not in ("move", "copy"):
+        errors.append("action must be move or copy.")
+    workers = cfg.get("face_workers", [])
+    if not isinstance(workers, list) or not all(isinstance(w, str) for w in workers):
+        errors.append("face_workers must be a list such as [\"gpu-box:16\"].")
+    elif workers:
+        try:
+            parse_workers(workers)
+        except ValueError as e:
+            errors.append(str(e))
+    raw_index = cfg.get("index_path")
+    if raw_index is not None:
+        if not isinstance(raw_index, str) or not raw_index.strip():
+            errors.append("index_path must be a file path (or left out for the default).")
+        else:
+            p = index_path(cfg)
+            if "%" in str(p) or not p.is_absolute():
+                errors.append("index_path must be a full path; %VARIABLES% must exist.")
+            elif str(p).startswith("\\\\"):
+                errors.append("index_path must be on a local drive, not a network share.")
+            elif under_onedrive(p):
+                errors.append("index_path is inside OneDrive, which would upload the index (captions, visible text "
+                              "and embeddings of your photos) to the cloud.")
+            elif not p.parent.is_dir():
+                warnings.append("index_path's folder does not exist yet; the first index run creates it.")
+    buckets = cfg.get("buckets")
+    if not isinstance(buckets, dict) or not buckets:
+        errors.append("buckets must list at least one bucket besides 'other'.")
+        return {"errors": errors, "warnings": warnings}
+    if "other" not in buckets:
+        errors.append("buckets must include 'other'.")
+    if len(buckets) < 2:
+        errors.append("Add at least one bucket besides 'other'.")
+    if len(buckets) > 60:
+        errors.append("Use at most 60 buckets.")
+    for name, desc in buckets.items():
+        if name in RESERVED_NAMES:
+            errors.append(f"Bucket name {name!r} is reserved by Windows and cannot be a folder name.")
+        elif not BUCKET_NAME_RE.match(name):
+            errors.append(f"Bucket name {name!r}: use lowercase letters, digits, _ and - (it becomes a folder name).")
+        if not isinstance(desc, str) or not desc.strip():
+            errors.append(f"Bucket {name!r} needs a description: the model sorts by it.")
+        elif len(desc) > 500:
+            errors.append(f"Bucket {name!r}: keep the description under 500 characters.")
+    return {"errors": errors, "warnings": warnings}
 
 
 def encode_image(path: Path, max_side: int) -> str:
@@ -1007,10 +1090,14 @@ def _run(a: argparse.Namespace) -> tuple[int, dict | None, str | None]:
         print(report, flush=True)
         return 0, result, report
     if a.cmd == "faces-setup":
-        for host in a.hosts:
+        runctl.emit("phase", name="setup", total=len(a.hosts))
+        for n, host in enumerate(a.hosts, 1):
+            runctl.checkpoint()
             info = setup_remote_worker(host, a.model)
             print(f"OK: {host} ({info.get('host')}) face worker ready: {info.get('provider')}", flush=True)
-        return 0, None, None
+            runctl.emit("item", phase="setup", n=n, total=len(a.hosts), path=host,
+                        result={"status": "ready", "provider": info.get("provider")})
+        return 0, {"hosts": len(a.hosts), "ready": len(a.hosts)}, None
     if a.cmd == "faces":
         workers = a.workers or load_config(a.config).get("face_workers") or ["local"]
         with runctl.folder_lock("faces", "read", [a.source], a.force):

@@ -135,6 +135,22 @@ describe('job arguments', () => {
     expect(buildSpec('apply', { folder: D }, dirs, jobs).args).toEqual(['apply', '--action=move', '--', path.join(sorted, JOURNAL_NAME)]);
   });
 
+  it('builds face tagging arguments; the photos must be outside the people folder, and fixture mode stays on this PC', () => {
+    const P = dirs.idFor(path.join(lib, 'sorted'));
+    const s = buildSpec('faces', { source: S, people: P, threshold: 0.5, margin: 0, recursive: true, limit: 0, workers: 'local:2' }, dirs, jobs);
+    expect(s.args).toEqual(['faces', `--people=${path.join(lib, 'sorted')}`, '--threshold=0.5', '--margin=0', '--recursive',
+      '--workers=local:2', '--', src]);
+    expect(s.folders).toEqual({ source: src, people: path.join(lib, 'sorted') });
+    expect(s.heavy).toBe(true);
+    expect(() => buildSpec('faces', { source: S, people: S }, dirs, jobs)).toThrow(/outside the people folder/);
+    expect(() => buildSpec('faces', { source: dirs.idFor(path.join(src, 'trip')), people: S }, dirs, jobs)).toThrow(/outside/);
+    expect(buildSpec('faces', { source: P, people: S }, dirs, jobs).args.at(-1)).toBe(path.join(lib, 'sorted'));
+    expect(() => buildSpec('faces', { source: S, people: P, workers: 'local,LAN-box:4' }, dirs, jobs)).toThrow(/stand-in/);
+    expect(() => buildSpec('faces-setup', { hosts: ['lan-box'] }, dirs, jobs)).toThrow(/never sets up/);
+    const real = new DirRegistry({});
+    expect(buildSpec('faces-setup', { hosts: ['lan-box', 'gpu-2'] }, real, jobs).args).toEqual(['faces-setup', '--', 'lan-box', 'gpu-2']);
+  });
+
   it('shows the same command as PowerShell text', () => {
     const def = path.join(photosortDir, 'config.json');
     expect(cliText(['group', '--name=it\'s', '--name=-x', '--', 'C:\\a b', '-x'], def, def))
@@ -179,6 +195,24 @@ describe('job runner', () => {
     expect(newest.items.map((i) => i.n)).toEqual([4, 5]);
     expect(newest.older).toBe(3);
     await m.close();
+  });
+
+  it('never passes an inherited stand-in face worker to a job, only the one the dashboard sets', async () => {
+    process.env.PHOTOSORT_FACE_WORKER = 'C:\\elsewhere\\worker.py';
+    try {
+      const cases: [Record<string, string> | undefined, string | null][] = [[undefined, null], [{ PHOTOSORT_FACE_WORKER: 'C:\\x\\fake.py' }, 'C:\\x\\fake.py']];
+      for (const [env, want] of cases) {
+        const { m } = manager({ env });
+        await m.init();
+        const rec = m.submit(fake(['sort', '--items=1']));
+        expect(await m.waitFor(rec.id, 15000)).toBe(true);
+        const out = JSON.parse(readFileSync(path.join(m.jobDir(rec.id), 'stdout.txt'), 'utf8')) as { face_worker: string | null };
+        expect(out.face_worker).toBe(want);
+        await m.close();
+      }
+    } finally {
+      delete process.env.PHOTOSORT_FACE_WORKER;
+    }
   });
 
   it('runs one heavy job at a time; a light job does not wait', async () => {

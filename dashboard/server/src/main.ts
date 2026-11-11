@@ -1,7 +1,7 @@
 // Dashboard server entry point. Started (hidden, detached) by ..\..\..\dashboard.ps1 through start.mjs.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -39,13 +39,16 @@ if (mode !== 'real' && mode !== 'fixture') fail('--mode must be real or fixture'
 const port = Number(values.port);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('--port must be 1024-65535');
 const dataDir = values['data-dir'] ? path.resolve(values['data-dir']) : fail('--data-dir is required');
-const configPath = values.config ? path.resolve(values.config) : fail('--config is required');
+const configArg = values.config ? path.resolve(values.config) : fail('--config is required');
 const photosortDir = path.resolve(values['photosort-dir'] ?? path.join(dashDir, '..'));
 const python = values.python ?? fail('--python is required');
 if (isUnderOneDrive(dataDir)) fail('the dashboard data folder must not be inside OneDrive');
 
 const version = (JSON.parse(readFileSync(path.join(dashDir, 'package.json'), 'utf8')) as { version: string }).version;
 mkdirSync(path.join(dataDir, 'logs'), { recursive: true });
+// Fixture mode works on a fresh copy of the fixture config, so saving in Settings never changes the tracked file.
+const configPath = mode === 'fixture' ? path.join(dataDir, 'config.json') : configArg;
+if (mode === 'fixture') copyFileSync(configArg, configPath);
 const logFile = path.join(dataDir, 'logs', `server-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.log`);
 const logger: LineLogger = {
   info: (o) => appendFileSync(logFile, JSON.stringify({ t: new Date().toISOString(), l: 'info', ...o }) + '\n'),
@@ -98,8 +101,8 @@ const { app, hub } = await buildApp({
   dataDir,
   python,
   photosortDir,
-  // Fixture mode only ever shows the generated fixture library.
-  fixtureRoots: mode === 'fixture' ? [path.join(dataDir, 'library')] : undefined,
+  // Fixture mode only ever shows the generated fixture library (and its reference photos of people).
+  fixtureRoots: mode === 'fixture' ? [path.join(dataDir, 'library'), path.join(dataDir, 'people')] : undefined,
   protectedDirs: [dataDir, path.join(process.env.LOCALAPPDATA ?? path.dirname(dataDir), 'PhotoSort'), photosortDir],
   webDist: path.join(dashDir, 'web', 'dist'),
   pairDir,

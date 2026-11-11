@@ -481,12 +481,12 @@ pack is intended for personal/non-commercial use; review the model license befor
 
 ## Dashboard (`dashboard.ps1`)
 
-A desktop window for PhotoSort, built in phases. **Now (P0–P3):** the window, its local server, PAIR
-health, **jobs** (sort, group, index, apply and undo with live progress), **search and gallery**
-(plain-language search, browsing the whole index, thumbnails, previews and video playback) and
+A desktop window for every PhotoSort feature, built in phases P0–P4 (all done): the window, its local server,
+PAIR health, **jobs** (sort, group, index, apply and undo with live progress), **search and gallery**
+(plain-language search, browsing the whole index, thumbnails, previews and video playback),
 [**runs, cluster and privacy**](#runs-cluster-and-privacy) (every run including terminal ones, the PAIR cluster
-and its routing audit, live privacy checks). **Next (P4):** faces and settings; until then those two pages show
-the matching CLI command.
+and its routing audit, live privacy checks) and [**faces and settings**](#faces-and-settings) (face tagging and
+its results; a checked editor for `config.json`).
 
 ```powershell
 cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
@@ -702,6 +702,53 @@ How it works:
   registry and GitHub (the Electron download).
 - "The dashboard is running; stop it before …" during setup: packages are never replaced while a dashboard runs.
 
+### Faces and settings
+
+The **Faces** page has two tabs:
+- **Tag faces:** the same job as `photosort.cmd faces`. Choose the photos and videos, the people folder (one
+  subfolder of reference photos per person) and, under Advanced, threshold, margin, limit and workers. Files are
+  only read; results go to `photosort_faces.json` in the folder. **People** lists each person's reference photos.
+  **Face workers** checks each worker (Ready, Needs setup, Refused, Unreachable): this PC's packages and model,
+  or a LAN machine's worker environment over SSH; no photo is sent. **Set up another machine** runs
+  `faces-setup HOST` as a job. Workers are this PC (`local`) or LAN machines; never a cloud service.
+- **Results:** pick a folder face tagging ran on. Filter by person, unknown faces, no faces or errors; the
+  detail pane boxes each face in the preview, with its similarity, and lists faces by moment for videos.
+
+The **Settings** page edits `config.json` with the checks PhotoSort itself applies:
+- **Models:** the sort/group, caption and embedding models, chosen from what PAIR lists. Cloud models are shown
+  disabled, and the server refuses them even if typed. When PAIR is not reachable, names are typed and a warning
+  says they could not be checked.
+- **Speed and limits** (parallel requests, image size, timeout, tries, default action), **face workers**, the
+  **search index** file and the **buckets** (add, rename, reorder, remove; `other` stays last and is required).
+- **Review changes** runs the same validation as the CLI (`dashboard_sidecar.py --check-config`) and lists every
+  change, error and warning, for example that a new embedding model needs `index` to run again before search
+  finds those files. **Save N changes** appears only after a clean review.
+- Saving keeps the previous file as `config.json.bak` (git-ignored), writes the new one atomically with its line
+  endings kept, and restarts the search helper. New jobs use the new settings; running jobs keep theirs. If
+  `config.json` changed on disk since the page loaded, saving is refused and offers to reload it.
+- The **This window** card has the content-protection and blur switches, the GPU in use, the thumbnail cache
+  size and **Clear cache**.
+- In fixture mode the page edits a copy in the fixture data folder (made fresh at each start), and the PAIR
+  address and index file are locked.
+- Not in Settings: the thumbnail cache limit (fixed at 3 GB) and the GPU choice (`dashboard.ps1 -Gpu`).
+
+### Accessibility
+
+Every control in every page has an accessible name, so a screen reader announces "Model", "Workers" or "Group
+request" rather than "edit text". Form fields get theirs from their label (`Field` in `web\src\components\ui.tsx`
+links the label and the hint to the control), and each page has one heading and one main region. The light theme's
+status and accent colors keep text at 4.5:1 contrast or better on every background, as the dark theme does.
+`server\test\fixture-window.test.ts` checks the names, the heading and the region on all nine pages, so a new
+control without a name fails the tests.
+
+### Not built: Edge as a fallback window
+
+The plan had `-Shell edge` (Edge app mode) for a PC where Electron can't be downloaded. It was left out because
+Electron already installs here, and Edge can't block its own cloud features (visual search, Copilot, sync) or give
+the window's network guard and content protection. It would also need a second way to sign in to the local
+server (a cookie with a CSRF check instead of the token that only the PhotoSort window holds). Without Electron,
+use the CLI. To add it later, decide that first: it loosens the privacy rules above.
+
 ## Configuration (`config.json`)
 
 | Key | Default | Meaning |
@@ -719,7 +766,8 @@ How it works:
 | `index_path` | `%LOCALAPPDATA%\PhotoSort\search_index.sqlite` | Search index file; keep it out of OneDrive |
 | `buckets` | 13 buckets | `name: description`. Descriptions are sent to the model, so make them specific. `other` is required. |
 
-To add/rename a bucket, edit `buckets` in `config.json` and add a one-line description.
+To add or rename a bucket, use the dashboard's **Settings** page (it checks the change before saving), or edit
+`buckets` in `config.json` and add a one-line description.
 
 ## How it works
 
@@ -879,10 +927,21 @@ item measurement: `make_search_fixture.py --out <new folder in %TEMP%> --count 3
 one for fixture mode, with a made-up cluster), the routing alerts, the privacy checks and the connection classes;
 `e2e.test.ts` also checks that a run started from the CLI shows up under Runs.
 
+Faces and settings: `tests\fake_face_worker.py` answers as InsightFace would without a model (the synthetic
+pictures say who is in them), so face tagging runs through the real worker protocol, pool, video frame sampling,
+matching and report. `tests\test_dashboard_fixtures.py` checks that run and that a cancelled one stops before the
+next picture and writes nothing; `tests\test_dashboard_sidecar.py` checks that face results are read only inside
+their folder and get media ids, that people-folder and worker checks in fixture mode never leave this PC, and
+that `--check-config` accepts the shipped configs and names every problem; `server\test\settings.test.ts` checks
+the config page's API: cloud models and bad values refused, a change reviewed without saving, an atomic save with
+a backup and CRLF kept, a stale page refused (409), and the token and strict request body.
+
 `server\test\fixture-window.test.ts` builds the current UI into a temporary folder and opens an isolated
 fixture-mode Electron window with empty synthetic folders. It checks Go/Enter, quoted paths, loading/error
 feedback and changing folders without accidentally submitting the Sort form. It also checks, with mocked index
 replies, that the Search page stays on screen when an index refresh cancels a reply that is still arriving
 (this used to blank the window right after indexing), and that a page that fails to draw shows "This page hit a
-problem" with Try again / Reload window while the navigation keeps working. The test never attaches to the
-user's window and removes its temporary files when it finishes.
+problem" with Try again / Reload window while the navigation keeps working. For P4 it checks the Faces page
+(filter by person, boxes over the preview), the Settings page (cloud models refused, review, save with a backup,
+Python refusals shown, Discard) and that every page names every control and has one heading and one main region.
+The test never attaches to the user's window and removes its temporary files when it finishes.

@@ -257,3 +257,127 @@ def test_video_preview_and_strip_decode_locally(tmp_path):
             assert image.width > 0 and not image.getexif()
             if kind == "strip":
                 assert image.width == 1280
+
+
+def write_faces(folder: Path, images: list, **meta) -> Path:
+    path = folder / "photosort_faces.json"
+    path.write_text(json.dumps({"format": "photosort-faces-v1", "model": "buffalo_l", "provider": "FakeColour",
+                                "threshold": 0.45, "margin": 0.05, "people": ["Alice", "Bob"], "summary": {"errors": 1},
+                                "images": images, **meta}), encoding="utf-8")
+    return path
+
+
+def test_face_results_are_read_only_inside_their_folder_and_their_files_get_media_ids(tmp_path):
+    cfg, root = fixture_index(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(cfg))
+    folder = root / "subset"
+    Image.new("RGB", (90, 60), "blue").save(folder / "new_face.jpg")  # not in the index
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (90, 60), "green").save(folder / "turned.jpg", exif=exif)
+    (tmp_path / "outside.jpg").write_bytes((folder / "new_face.jpg").read_bytes())
+    alice = {"person": "Alice", "similarity": 0.94, "bbox": [1, 2, 30, 40]}
+    stranger = {"person": None, "similarity": 0.06, "bbox": [40, 2, 70, 40]}
+    write_faces(folder, [
+        {"file": "sample_00001.jpg", "faces": [alice, stranger]},
+        {"file": "new_face.jpg", "faces": [{**alice, "person": "Bob"}]},
+        {"file": "turned.jpg", "faces": []},
+        {"file": "clip.mp4", "type": "video", "error": "VideoError: no decodable frames"},
+        {"file": "../outside.jpg", "faces": [alice]},
+        {"file": str(tmp_path / "outside.jpg"), "faces": [alice]},
+        {"file": "notes.txt", "faces": [alice]},
+        "not a record",
+    ])
+    svc = Service(config, tmp_path / "data", [root])
+    try:
+        read = svc.call("faces.read", {"folder": str(folder)})
+        assert read["counts"] == {"all": 4, "people": {"Alice": 1, "Bob": 1}, "unknown": 1, "none": 1, "errors": 1}
+        assert (read["skipped"], read["provider"], read["people"]) == (4, "FakeColour", ["Alice", "Bob"])
+
+        def names(filter, **page):
+            out = svc.call("faces.items", {"folder": str(folder), "filter": filter, **page})
+            return [i["name"] for i in out["items"]], out["total"], out["nextCursor"]
+
+        assert names("all", limit=3) == (["sample_00001.jpg", "new_face.jpg", "turned.jpg"], 4, 3)
+        assert names("person:Alice") == (["sample_00001.jpg"], 1, None)
+        assert names("unknown")[0] == ["sample_00001.jpg"]
+        assert (names("none")[0], names("errors")[0]) == (["turned.jpg"], ["clip.mp4"])
+        assert names("person:Nobody") == ([], 0, None)
+
+        listed = {i["name"]: i for i in svc.call("faces.items", {"folder": str(folder)})["items"]}
+        indexed = next(i for i in svc.call("index.list", {})["items"] if i["name"] == "sample_00001.jpg")
+        assert listed["sample_00001.jpg"]["id"] == indexed["id"]  # one id per file, indexed or not
+        new = listed["new_face.jpg"]
+        assert (new["indexed_at"], new["people"], new["faces"], new["status"]) == (None, ["Bob"], 1, "named")
+        assert Path(svc.call("media.make", {"id": new["id"], "kind": "thumb"})["path"]).is_file()
+
+        one = svc.call("faces.item", {"folder": str(folder), "id": listed["sample_00001.jpg"]["id"]})
+        assert (one["width"], one["height"], one["detections"]) == (90, 60, [alice, stranger])
+        turned = svc.call("faces.item", {"folder": str(folder), "id": listed["turned.jpg"]["id"]})
+        assert (turned["width"], turned["height"]) == (60, 90)  # the upright picture, as the worker saw it
+        with pytest.raises(MediaUnavailable, match="missing"):
+            svc.call("faces.item", {"folder": str(folder), "id": "m_" + "a" * 32})
+        with pytest.raises(MediaUnavailable, match="no_results"):
+            svc.call("faces.read", {"folder": str(root / "elsewhere")})
+        for bad in (str(tmp_path), "subset", str(folder / "new_face.jpg")):
+            with pytest.raises((LocalOnlyError, MediaUnavailable)):
+                svc.call("faces.read", {"folder": bad})
+        write_faces(root / "elsewhere", [], format="something-else")
+        with pytest.raises(MediaUnavailable, match="bad_results"):
+            svc.call("faces.read", {"folder": str(root / "elsewhere")})
+    finally:
+        svc.close()
+
+
+def test_people_folder_and_worker_checks_in_fixture_mode_never_leave_this_pc(tmp_path, monkeypatch):
+    cfg, root = fixture_index(tmp_path)
+    cfg["face_workers"] = ["local:2", "lan-box:4"]
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(cfg))
+    people = root / "people"
+    for name, count in (("Bob", 1), ("Alice", 6), ("Empty", 0)):
+        (people / name).mkdir(parents=True)
+        for i in range(count):
+            Image.new("RGB", (40, 50), "white").save(people / name / f"ref_{i}.jpg")
+    monkeypatch.setattr("dashboard_faces.subprocess.run", lambda *a, **k: pytest.fail("fixture mode ran a command"))
+    svc = Service(config, tmp_path / "data", [root])
+    try:
+        out = svc.call("faces.people", {"dir": str(people)})
+        assert [(p["name"], p["count"], len(p["samples"])) for p in out["people"]] == [("Alice", 6, 4), ("Bob", 1, 1)]
+        assert out["problems"] == ["Empty: no photos"]
+        sample = out["people"][1]["samples"][0]
+        assert Path(svc.call("media.make", {"id": sample["id"], "kind": "thumb"})["path"]).is_file()
+        assert svc.call("faces.workers", {}) == {"configured": ["local:2", "lan-box:4"],
+                                                 "effective": ["local:2", "lan-box:4"], "fixture": True}
+        checked = svc.call("faces.check_workers", {})["workers"]
+        assert [(w["host"], w["threads"], w["state"]) for w in checked] == [("local", 2, "ready"),
+                                                                           ("lan-box", 4, "skipped")]
+    finally:
+        svc.close()
+
+def test_check_config_accepts_shipped_configs_and_names_every_problem(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from photosort import config_problems
+
+    here = Path(__file__).resolve().parents[1]
+    for shipped in (here / "config.json", here / "dashboard" / "fixtures" / "config.fixture.json"):
+        assert config_problems(json.loads(shipped.read_text(encoding="utf-8")))["errors"] == []
+    good = json.loads((here / "dashboard" / "fixtures" / "config.fixture.json").read_text(encoding="utf-8"))
+    monkeypatch.setenv("OneDrive", str(tmp_path / "od"))
+    bad = {**good, "base_url": "http://10.0.0.5:11434", "embed_model": "nomic:cloud", "concurrency": True,
+           "timeout_s": 2, "action": "zap", "face_workers": ["-x"], "index_path": str(tmp_path / "od" / "i.sqlite"),
+           "buckets": {"CON": "x", "nul": "n", "ok": " ", "other": "o"}}
+    errors = " | ".join(config_problems(bad)["errors"])
+    for part in ("non-loopback", "nomic:cloud", "concurrency", "timeout_s", "action", "face worker", "OneDrive",
+                 "'CON'", "'nul' is reserved by Windows", "'ok' needs a description"):
+        assert part in errors
+    assert "'other'" in config_problems({**good, "buckets": {"food": "f"}})["errors"][0]
+    assert config_problems({**good, "index_path": str(tmp_path / "new" / "i.sqlite")})["warnings"]
+    assert config_problems([])["errors"]
+
+    run = lambda text: json.loads(subprocess.run([sys.executable, str(here / "dashboard_sidecar.py"), "--check-config"],
+                                                 input=text.encode(), capture_output=True, check=True, cwd=here).stdout)
+    assert run(json.dumps(good)) == {"errors": [], "warnings": []}
+    assert run("{not json") == {"errors": ["The config is not valid JSON."], "warnings": []}

@@ -55,7 +55,7 @@ function NextSteps({ job, start, busy }: { job: JobView; start(kind: JobKind, pa
   const s = job.summary ?? {};
   const finished = job.status === 'ok' || job.status === 'errors';
   const steps: ReactNode[] = [];
-  const editable = job.kind === 'sort' || job.kind === 'group' || job.kind === 'index';
+  const editable = job.kind === 'sort' || job.kind === 'group' || job.kind === 'index' || job.kind === 'faces';
 
   if ((job.kind === 'sort' || job.kind === 'group') && job.params.action === 'report' && finished && job.runId) {
     const n = job.kind === 'sort' ? num(s.sorted) : num(s.matched);
@@ -90,18 +90,26 @@ function NextSteps({ job, start, busy }: { job: JobView; start(kind: JobKind, pa
       </button>,
     );
   }
+  const results = job.kind === 'faces' && finished ? (job.folders.source as { dirId?: string } | undefined)?.dirId : undefined;
+  if (results) {
+    steps.push(<button type="button" key="open" className="primary" onClick={() => navigate(`/faces?folder=${encodeURIComponent(results)}`)}>
+      <Icon name="faces" size={14} /> See who is in them</button>);
+  }
   if (editable && !ACTIVE.has(job.status)) {
-    steps.push(<button type="button" key="edit" className="ghost" onClick={() => navigate(`/${job.kind === 'index' ? 'search' : job.kind}?job=${job.id}`)}>Edit and run again</button>);
+    steps.push(<button type="button" key="edit" className="ghost" onClick={() => navigate(`${pageOf(job.kind)}?job=${job.id}`)}>Edit and run again</button>);
   }
   return steps.length ? <div className="actions">{steps}</div> : null;
 }
+
+/** The page with a job kind's form. */
+const pageOf = (kind: JobKind): string => `/${kind === 'index' ? 'search' : kind}`;
 
 /** For a refused group request or a locked folder: the CLI's message plus the fixes it suggests. */
 function Fixes({ job }: { job: JobView }) {
   const [, navigate] = useLocation();
   const errs = job.messages.filter((m) => m.level === 'error');
   if (!errs.length || ACTIVE.has(job.status)) return null;
-  const page = `/${job.kind === 'index' ? 'search' : job.kind}`;
+  const page = pageOf(job.kind);
   const fixes: ReactNode[] = [];
   const text = errs.map((m) => m.text).join('\n');
   if (job.kind === 'group') {
@@ -112,7 +120,7 @@ function Fixes({ job }: { job: JobView }) {
       fixes.push(<button type="button" key="dates" className="ghost" onClick={() => navigate(`${page}?job=${job.id}&advanced=1`)}>Set the dates…</button>);
     }
   }
-  if (errs.some((m) => m.kind === 'locked') && (job.kind === 'sort' || job.kind === 'group' || job.kind === 'index')) {
+  if (errs.some((m) => m.kind === 'locked') && (job.kind === 'sort' || job.kind === 'group' || job.kind === 'index' || job.kind === 'faces')) {
     fixes.push(<button type="button" key="force" className="ghost" onClick={() => navigate(`${page}?job=${job.id}&force=1`)}>Run anyway…</button>);
   }
   return fixes.length ? <div className="actions">{fixes}</div> : null;
@@ -157,6 +165,11 @@ function Results({ job, rows }: { job: JobView; rows: JobRows }) {
     facts.push(['Planned', num(s.planned)], [job.params.action === 'copy' ? 'Copied' : 'Moved', num(s.applied)],
       ['Changed since the preview', num(s.changed)], ['Errors', num(s.errors)]);
   }
+  if (job.kind === 'faces' && job.summary) {
+    facts.push(['Photos', num(s.images)], ['Videos', num(s.videos)], ['Faces found', num(s.faces)], ['Named', num(s.matched)],
+      ['Unknown', num(s.unknown)], ['Errors', num(s.errors)]);
+  }
+  if (job.kind === 'faces-setup' && job.summary) facts.push(['Machines ready', num(s.ready)]);
   const problems = Array.isArray(s.problem_files) ? (s.problem_files as [string, string, string][]) : [];
   const restorable = Array.isArray(s.restored_files) ? (s.restored_files as [string, string][]) : [];
   const showBars = Object.keys(job.counts).length > 0;
@@ -216,7 +229,7 @@ export function JobPage({ id }: { id: string }) {
         <Progress done={job.done} total={job.total} active={active} />
         <div className="stats">
           {job.phase && <Stat k="Step" v={job.phase.replace('_', ' ')} />}
-          <Stat k="Files" v={`${job.done.toLocaleString()}${job.total ? ` / ${job.total.toLocaleString()}` : ''}`} />
+          <Stat k={job.kind === 'faces-setup' ? 'Machines' : 'Files'} v={`${job.done.toLocaleString()}${job.total ? ` / ${job.total.toLocaleString()}` : ''}`} />
           {job.errors > 0 && <Stat k="Errors" v={<span className="bad">{job.errors}</span>} />}
           {p.elapsedS !== undefined && <Stat k={active ? 'Elapsed' : 'Duration'} v={duration(job.durationS ?? p.elapsedS)} />}
           {p.perMin !== undefined && <Stat k="Speed" v={`${Math.round(p.perMin)} files/min`} />}

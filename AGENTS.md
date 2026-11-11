@@ -163,15 +163,18 @@ New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd fac
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
 
-## Dashboard (`dashboard.ps1`, phases P0–P3 done; P4 faces and settings next)
+## Dashboard (`dashboard.ps1`, phases P0–P4 done)
 
 Plan and phases: README "Dashboard". Code: `dashboard\server` (Node.js + Fastify; jobs in `jobs.ts`, routes in
 `routes.ts`, folder picker in `dirs.ts`, search/gallery routes in `gallery.ts`, its Python helper in
 `sidecar.ts`, runs history in `runs.ts`, PAIR log reader in `pairlog.ts` with its routes in `cluster.ts`,
-privacy checks and the connection list in `privacy.ts`), `dashboard_sidecar.py` and `thumbs.py` (cached search,
-index browsing, metadata-free thumbnails, journal reading), `dashboard\shell` (Electron window),
-`dashboard\web` (React SPA; pages in `web\src\pages`, grid in `components\Gallery.tsx`), `dashboard\fixtures`
-and `tests\fake_pair.py` (fixture mode; with `--pair-dir` it also writes a synthetic PAIR log and member list).
+privacy checks and the connection list in `privacy.ts`, face results and worker checks in `faces.ts`, the
+config editor in `settings.ts`), `dashboard_sidecar.py` and `thumbs.py` (cached search, index browsing,
+metadata-free thumbnails, journal reading), `dashboard_faces.py` (face results, people folder and worker checks
+for the sidecar), `dashboard\shell` (Electron window), `dashboard\web` (React SPA; pages in `web\src\pages`, grid
+in `components\Gallery.tsx`, shared controls in `components\ui.tsx`), `dashboard\fixtures`, `tests\fake_pair.py`
+(fixture mode; with `--pair-dir` it also writes a synthetic PAIR log and member list) and
+`tests\fake_face_worker.py` (a stand-in for the InsightFace worker; fixture mode's `local` face worker).
 
 - **Agents use fixture mode only:** `.\dashboard.ps1 <command> -Fixture -Yes`. Fixture mode has a synthetic
   library, a fake PAIR on `127.0.0.1:47617` (the server starts it and it exits with the server), its own data
@@ -181,27 +184,33 @@ and `tests\fake_pair.py` (fixture mode; with `--pair-dir` it also writes a synth
   paths. Never read `%LOCALAPPDATA%\PhotoSort\dashboard`: its `state.json` holds the token, the logs and window
   cache are the user's, `jobs\<id>\` (`job.json`, `events.jsonl`, `stdout.txt`, `stderr.txt`) holds file names
   and per-file results, and `thumbs\` holds pictures of the user's photos. Never call the search or media API
-  in real mode: results hold file names, captions and pictures. The same goes for `/api/runs` (file names) and
-  `folders.json`. Never read the real PAIR log beyond its structure (counts, field names); the Cluster page and
-  `/api/pair/*` are fixture-only for agents.
+  in real mode: results hold file names, captions and pictures. The same goes for `/api/runs` (file names),
+  `/api/faces*` (people names, file names, face boxes; the face results file `photosort_faces.json` in the user's
+  folders is just as private) and `folders.json`. Never read the real PAIR log beyond its structure (counts, field
+  names); the Cluster page and `/api/pair/*` are fixture-only for agents.
 - Pass `-Yes` whenever nobody can answer. Without it, steps that need consent are skipped and the exit code is 2;
   `stop` with a running job refuses (exit 1), and `stop -Yes` stops the job safely first.
 - Smoke test after changes:
   - `setup -Fixture -Yes`, `start -Fixture -NoOpen`, `status -Fixture`, `selftest -Fixture` (9 PASS; it also
-    draws every page and a run's page and fails on the error boundary, an empty page or a console error),
+    draws all 9 pages and a run's page and fails on the error boundary, an empty page or a console error),
     `stop -Fixture`;
   - after job changes, also start a fixture sort preview through the API (token and port from the fixture
     `state.json`; folder id from `GET /api/fs/roots`), wait for `ok`, then `stop -Fixture` while one runs;
   - after search/gallery changes, run a fixture index job (`{"kind":"index","params":{"source":<dirId>}}`), then
     `GET /api/index/stats`, `POST /api/search`, a `/media/<id>/thumb?v=<revision>` and a video `/original` with
     a `Range` header; after `stop -Fixture` no `dashboard_sidecar` python may remain;
+  - after faces changes, run a fixture faces job (`{"kind":"faces","params":{"source":<library id>,"people":
+    <people id>,"workers":"local:2"}}`; both ids from `GET /api/fs/roots`), wait for `ok`, then
+    `GET /api/faces?folder=<library id>`; after settings changes, `PUT /api/config` with `save` false returns the
+    review without writing (only the fixture copy is ever written);
   - after changing `dashboard.ps1`, run it in both `pwsh` and `powershell` (5.1);
   - keep `dashboard.ps1` ASCII-only, because 5.1 reads BOM-less files as ANSI.
 - Unit tests: in `dashboard\`, put the private Node.js on PATH, then run `npm run typecheck`, `npm test`
   (including `server\test\e2e.test.ts` with the real CLI and `fake_pair.py`) and `npm run build`
   (README "Tests"). Python is found through `PHOTOSORT_PYTHON`, else `photosort.cmd`. The fixture and CLI tests
   are in pytest. `server\test\fixture-window.test.ts` builds the current UI and uses a separate fixture Electron
-  window with empty synthetic folders and mocked index replies; it never attaches to the user's window.
+  window with empty synthetic folders and mocked index replies; it never attaches to the user's window. It also
+  fails when a page has a control with no accessible name, so give every new control a label or an `aria-label`.
 - Invariants, all tested:
   - only `server\src\localfetch.ts` opens connections: loopback, read-only PAIR paths, cloud models refused;
   - every route declares an auth class;
@@ -224,8 +233,22 @@ and `tests\fake_pair.py` (fixture mode; with `--pair-dir` it also writes a synth
     thumbnail processes otherwise hangs while a read is pending on the stdin pipe;
   - the PAIR log is only read (`pairlog.ts` opens no connection); folder ids and run keys (`d_<id>~<runId>`)
     last one server session, so the UI treats a 404 as "reload the list"; `/api/privacy/connections` passes only
-    validated integer pids to PowerShell.
-  Never loosen the CSP, the window's request guard or the token handling.
+    validated integer pids to PowerShell;
+  - settings: `PUT /api/config` takes only `config`, `etag` and `save`; cloud model names are refused even when
+    typed (`isCloudModel`); a change is validated by `dashboard_sidecar.py --check-config` (the CLI's own
+    `config_problems()` plus stricter bucket-name checks); a stale `etag` gets 409; a save copies
+    `config.json.bak`, writes a temp file and renames it, keeps the file's line endings and restarts only the
+    sidecar; fixture mode edits a copy and locks `base_url` and `index_path`;
+  - faces: results are read only from `photosort_faces.json` in a registered folder, with the same HMAC media
+    ids as the index; a worker check only runs `test -x` over SSH after the LAN-only check and sends no media;
+    fixture mode runs only the `local` stand-in worker, refuses `faces-setup`, and a job never inherits
+    `PHOTOSORT_FACE_WORKER` from the environment;
+  - every control has an accessible name (the form `Field` in `web\src\components\ui.tsx` links its label; a
+    control on its own needs `aria-label`), each page has one `main` and one `h1`, and the light theme's text
+    colors keep 4.5:1 contrast; the fixture-window test checks the names and landmarks on all 9 pages.
+  Never loosen the CSP, the window's request guard or the token handling. Do not add a browser shell (Edge or
+  any browser as a fallback window) without asking: it can't block its own cloud features, and it needs a second
+  sign-in path to the server (README "Not built: Edge as a fallback window").
 - Stop processes only through `dashboard.ps1 stop` (`-Force` if needed) or a job's cancel. They end only process
   ids they have verified; never stop node, electron or python by name.
 - Electron facts:

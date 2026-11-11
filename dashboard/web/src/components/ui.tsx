@@ -1,6 +1,6 @@
 // Small shared pieces: rows, status badges, progress bars, count bars, copy buttons, the CLI box and the page
 // error boundary.
-import { Component, useState, type ReactNode } from 'react';
+import { Children, Component, cloneElement, isValidElement, useId, useState, type ReactElement, type ReactNode } from 'react';
 import type { JobStatus } from '../api.ts';
 import { Icon } from '../icons.tsx';
 import { STATUS } from '../jobs.ts';
@@ -101,12 +101,19 @@ export function CliBox({ cli, error, hint }: { cli?: string; error?: string; hin
   );
 }
 
+const NATIVE_CONTROLS = new Set(['input', 'select', 'textarea']);
+
+/** A labelled setting. A single native input, select or textarea without its own aria-label is named by the visible
+ *  label and described by the hint; components such as NumberInput name themselves. */
 export function Field({ label, hint, children, wide }: { label: string; hint?: ReactNode; children: ReactNode; wide?: boolean }) {
+  const id = useId();
+  const only = Children.count(children) === 1 && isValidElement(children) ? (children as ReactElement<Record<string, unknown>>) : null;
+  const names = only && typeof only.type === 'string' && NATIVE_CONTROLS.has(only.type) && !only.props['aria-label'] && !only.props['aria-labelledby'];
   return (
     <div className={`field${wide ? ' wide' : ''}`}>
-      <span className="field-label">{label}</span>
-      {children}
-      {hint && <span className="field-hint">{hint}</span>}
+      <span className="field-label" id={`${id}-label`}>{label}</span>
+      {names ? cloneElement(only, { 'aria-labelledby': `${id}-label`, ...(hint ? { 'aria-describedby': `${id}-hint` } : {}) }) : children}
+      {hint && <span className="field-hint" id={`${id}-hint`}>{hint}</span>}
     </div>
   );
 }
@@ -124,17 +131,22 @@ export function Segmented<T extends string>({ value, options, onChange, label }:
   );
 }
 
-/** A number input that may be left empty (then the config default applies). */
-export function NumberInput({ value, onChange, min, max, placeholder, label }: {
-  value?: number; onChange(v: number | undefined): void; min: number; max: number; placeholder?: string; label: string;
+/** A number input that may be left empty (then the config default applies). With `clampOnBlur`, typing is free
+ * (so 1024 can be typed into a 256–4096 field) and the range is applied when the field loses focus. */
+export function NumberInput({ value, onChange, min, max, placeholder, label, clampOnBlur }: {
+  value?: number; onChange(v: number | undefined): void; min: number; max: number; placeholder?: string; label: string; clampOnBlur?: boolean;
 }) {
+  const clamp = (n: number) => Math.min(max, Math.max(min, n));
   return (
     <input type="number" inputMode="numeric" min={min} max={max} step={1} placeholder={placeholder} value={value ?? ''}
       aria-label={label}
       onChange={(e) => {
         const t = e.target.value.trim();
         const n = Number(t);
-        onChange(t === '' || !Number.isInteger(n) ? undefined : Math.min(max, Math.max(min, n)));
+        onChange(t === '' || !Number.isInteger(n) ? undefined : clampOnBlur ? n : clamp(n));
+      }}
+      onBlur={() => {
+        if (clampOnBlur && value !== undefined && clamp(value) !== value) onChange(clamp(value));
       }} />
   );
 }

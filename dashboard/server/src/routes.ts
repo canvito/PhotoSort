@@ -17,6 +17,10 @@ const MODEL = { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$' }
 const LIMIT = { type: 'integer', minimum: 0, maximum: 10_000_000 };
 const CONCURRENCY = { type: 'integer', minimum: 1, maximum: 64 };
 const FORCE = { type: 'boolean' };
+// "local", "local:4", "lan-box:8,local:2": SSH host aliases or local, each with an optional thread count.
+const WORKER = '[A-Za-z0-9][A-Za-z0-9._@-]{0,62}(:\\d{1,3})?';
+export const WORKERS = { type: 'string', maxLength: 1000, pattern: `^${WORKER}(,${WORKER}){0,31}$` };
+const HOST = { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' };
 
 const obj = (properties: Record<string, unknown>, required: string[] = []) =>
   ({ type: 'object', additionalProperties: false, properties, ...(required.length ? { required } : {}) });
@@ -35,6 +39,12 @@ export const PARAM_SCHEMAS: Record<JobKind, object> = {
   index: obj({ source: DIR_ID, limit: LIMIT, concurrency: CONCURRENCY, force: FORCE }, ['source']),
   undo: obj({ job: JOB_REF, folder: DIR_ID, runId: RUN_ID, dryRun: { type: 'boolean' }, force: FORCE }),
   apply: obj({ job: JOB_REF, folder: DIR_ID, runId: RUN_ID, action: { enum: ['move', 'copy'] }, force: FORCE }),
+  faces: obj({
+    source: DIR_ID, people: DIR_ID, threshold: { type: 'number', minimum: 0, maximum: 1 },
+    margin: { type: 'number', minimum: 0, maximum: 2 }, recursive: { type: 'boolean' }, limit: LIMIT, workers: WORKERS,
+    force: FORCE,
+  }, ['source', 'people']),
+  'faces-setup': obj({ hosts: { type: 'array', minItems: 1, maxItems: 16, uniqueItems: true, items: HOST } }, ['hosts']),
 };
 
 export class BadRequest extends Error {
@@ -143,8 +153,35 @@ export function buildSpec(kind: JobKind, p: P, dirs: DirRegistry, jobs: JobManag
       args.push('--', journal);
       break;
     }
+    case 'faces': {
+      folders.source = folder('Folder', p.source);
+      folders.people = folder('People folder', p.people);
+      const inside = path.relative(folders.people.toLowerCase(), folders.source.toLowerCase());
+      if (!inside || (inside !== '..' && !inside.startsWith(`..${path.sep}`) && !path.isAbsolute(inside))) {
+        throw new BadRequest('Pick a folder of photos outside the people folder (it holds only the reference photos).');
+      }
+      const workers = typeof p.workers === 'string' ? p.workers : undefined;
+      // Fixture mode never contacts another machine: only this PC's stand-in worker runs.
+      if (dirs.fixture && workers?.split(',').some((w) => w.split(':')[0].toLowerCase() !== 'local')) {
+        throw new BadRequest('Fixture mode only runs the local stand-in face worker.', 403);
+      }
+      args.push(`--people=${folders.people}`);
+      opt(args, '--threshold', p.threshold);
+      opt(args, '--margin', p.margin);
+      opt(args, '--recursive', p.recursive);
+      opt(args, '--limit', p.limit || undefined);
+      opt(args, '--workers', workers);
+      opt(args, '--force', p.force);
+      args.push('--', folders.source);
+      break;
+    }
+    case 'faces-setup': {
+      if (dirs.fixture) throw new BadRequest('Fixture mode never sets up other machines.', 403);
+      args.push('--', ...(p.hosts as string[]));
+      break;
+    }
   }
-  for (const k of ['source', 'dest', 'folder']) delete params[k];
+  for (const k of ['source', 'dest', 'folder', 'people']) delete params[k];
   return { kind, params, folders, args, heavy: !(kind === 'undo' && p.dryRun === true) };
 }
 

@@ -12,15 +12,17 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
+from dashboard_faces import Faces
 from local_only import LocalOnlyError, under_onedrive
 from photo_search import (PairSearchClient, SearchError, _folder_key, _is_under, from_blobs, index_path,
                           ranked_indices, score_vectors, settings)
-from photosort import IMAGE_EXTS, encode_image, journal_items, journal_runs, load_config
+from photosort import IMAGE_EXTS, config_problems, encode_image, journal_items, journal_runs, load_config
 from media import VIDEO_EXTS, is_video
 from thumbs import MediaUnavailable, ThumbCache, is_placeholder, media_stat, revision
 
@@ -30,6 +32,8 @@ JOURNAL_RE = re.compile(r"^_photosort_journal(-[^\\/]+)?\.jsonl$", re.IGNORECASE
 
 class Library:
     """A persistent read-only SQLite connection detects CLI writes without changing its journal mode."""
+    MAX_EXTRAS = 50_000
+
     def __init__(self, cfg: dict, data_dir: Path, fixture_roots: list[Path] | None = None, notify=None):
         self.cfg, self.db_path = cfg, index_path(cfg).resolve()
         if under_onedrive(self.db_path) or str(self.db_path).startswith("\\\\"):
@@ -42,8 +46,10 @@ class Library:
         self.db = None
         self.file_id = None
         self.version = None
-        self.generation = 0
+        # Starts from the clock so it keeps growing across sidecar restarts (pages compare it).
+        self.generation = time.time_ns() // 1_000_000
         self.rows, self.by_id, self.orders = [], {}, {}
+        self.extras: OrderedDict[str, dict] = OrderedDict()
         self._resolved_dirs = {}
         self.blocks = None
         self.lock = threading.RLock()
@@ -105,7 +111,7 @@ class Library:
             row = dict(raw)
             if not self.allowed(row["path"], check_link=False):  # file links are refused when a file is opened
                 continue
-            row["id"] = "m_" + hmac.new(self.secret, os.path.normcase(row["path"]).encode("utf-8"), "sha256").hexdigest()[:32]
+            row["id"] = self.row_id(row["path"])
             row["kind"] = "video" if is_video(row["path"]) else "photo"
             self.rows.append(row)
         self.by_id = {r["id"]: r for r in self.rows}
@@ -128,9 +134,27 @@ class Library:
                 "placeholder": bool(st and is_placeholder(st)),
                 "revision": revision(st) if st else f'{row["size"]:x}-{row["mtime_ns"]:x}'}
 
+    def row_id(self, path: str) -> str:
+        return "m_" + hmac.new(self.secret, os.path.normcase(path).encode("utf-8"), "sha256").hexdigest()[:32]
+
+    def remember(self, path: Path, people_count: int = 0) -> dict:
+        """The row for a file shown outside the index (face results, people samples), so the media routes can serve
+        it by id. Indexed files keep their index row; the rest are kept in a bounded LRU."""
+        id = self.row_id(str(path))
+        row = self.by_id.get(id)
+        if row is not None:
+            return row
+        row = self.extras.pop(id, None) or {"id": id, "path": str(path), "size": 0, "mtime_ns": 0, "indexed_at": None,
+                                            "kind": "video" if is_video(path) else "photo"}
+        row["people_count"] = people_count
+        self.extras[id] = row
+        while len(self.extras) > self.MAX_EXTRAS:
+            self.extras.popitem(last=False)
+        return row
+
     def get_row(self, id: str) -> dict:
         self.sync()
-        row = self.by_id.get(id)
+        row = self.by_id.get(id) or self.extras.get(id)
         if row is None or not self.allowed(row["path"]):
             raise MediaUnavailable("missing")
         return row
@@ -239,6 +263,7 @@ class Service:
         if under_onedrive(data_dir):
             raise LocalOnlyError("Dashboard data must stay outside OneDrive.")
         self.library = Library(load_config(config_path), data_dir, roots, notify)
+        self.faces = Faces(self.library, config_path)
         self.cache = ThumbCache(data_dir / "thumbs")
         self._journals: dict[str, tuple] = {}
         self._journal_lock = threading.Lock()
@@ -293,8 +318,20 @@ class Service:
         if method == "journal.items":
             return journal_items(self.journal_entries(str(params["journal"])), str(params["runId"]),
                                  max(0, int(params.get("offset", 0))), min(5000, max(1, int(params.get("limit", 500)))))
+        if method == "faces.workers":
+            return self.faces.workers()
+        if method == "faces.check_workers":
+            return self.faces.check_workers(params.get("workers"))
         lib = self.library
         with lib.lock:
+            if method == "faces.read":
+                return self.faces.read(params["folder"])
+            if method == "faces.items":
+                return self.faces.items(**params)
+            if method == "faces.item":
+                return self.faces.item(**params)
+            if method == "faces.people":
+                return self.faces.people(params["dir"])
             if method == "index.stats":
                 self.cache.maintain()
                 return {**lib.stats(), "cache": self.cache.info()}
@@ -337,7 +374,21 @@ class Service:
         self.library.close()
 
 
+def check_config() -> int:
+    """`--check-config`: read a config from stdin and print its problems. Needs no index or PAIR, so a config the
+    sidecar cannot start with can still be checked and fixed."""
+    sys.stdout.reconfigure(encoding="utf-8")
+    try:
+        result = config_problems(json.loads(sys.stdin.buffer.read().decode("utf-8")))
+    except ValueError:
+        result = {"errors": ["The config is not valid JSON."], "warnings": []}
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
+
+
 def main():
+    if sys.argv[1:] == ["--check-config"]:
+        return check_config()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, required=True)
     ap.add_argument("--data-dir", type=Path, required=True)

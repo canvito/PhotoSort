@@ -36,13 +36,14 @@ function Thumb({ item, eager }: { item: MediaItem; eager: boolean }) {
   );
 }
 
-function Tile({ item, index, count, x, y, active, opened, showScore, eager, idBase, onPick }: {
+function Tile({ item, index, count, x, y, active, opened, showScore, eager, idBase, sub, onPick }: {
   item?: MediaItem; index: number; count: number; x: number; y: number; active: boolean; opened: boolean;
-  showScore: boolean; eager: boolean; idBase: string; onPick(i: number): void;
+  showScore: boolean; eager: boolean; idBase: string; sub?: string; onPick(i: number): void;
 }) {
+  const subText = sub ?? item?.folder;
   return (
     <div role="option" id={`${idBase}-${index}`} aria-selected={active} aria-posinset={index + 1} aria-setsize={count}
-      aria-label={item ? `${item.name}${item.kind === 'video' ? ', video' : ''}${item.placeholder ? ', cloud only' : ''}${item.exists ? '' : ', missing'}` : 'Loading'}
+      aria-label={item ? `${item.name}${item.kind === 'video' ? ', video' : ''}${sub ? `, ${sub}` : ''}${item.placeholder ? ', cloud only' : ''}${item.exists ? '' : ', missing'}` : 'Loading'}
       className={`tile${active ? ' active' : ''}${opened ? ' opened' : ''}${item && !viewable(item) ? ' dim' : ''}`}
       style={{ transform: `translate(${x}px, ${y}px)`, width: TILE_W, height: TILE_H }}
       onClick={() => onPick(index)}>
@@ -52,12 +53,12 @@ function Tile({ item, index, count, x, y, active, opened, showScore, eager, idBa
         {showScore && item?.score !== undefined && <span className="tile-score" title="Match score">{item.score.toFixed(3)}</span>}
       </div>
       <div className="tile-name" title={item?.name}>{item?.name ?? '\u00a0'}</div>
-      <div className="tile-sub" title={item?.folder}>{item?.folder ?? '\u00a0'}</div>
+      <div className="tile-sub" title={subText}>{subText ?? '\u00a0'}</div>
     </div>
   );
 }
 
-export function Gallery({ source, active, openedId, onActive, onOpen, onClose, showScore = false, scrollKey, resetKey, label, empty, gridRef }: {
+export function Gallery({ source, active, openedId, onActive, onOpen, onClose, showScore = false, scrollKey, resetKey, label, empty, gridRef, subtitle }: {
   source: GallerySource;
   active: number;
   openedId?: string;
@@ -74,6 +75,8 @@ export function Gallery({ source, active, openedId, onActive, onOpen, onClose, s
   label: string;
   empty?: ReactNode;
   gridRef?: Ref<HTMLDivElement>;
+  /** The line under the name (default: the folder). */
+  subtitle?(item: MediaItem): string;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const idBase = useId();
@@ -192,6 +195,7 @@ export function Gallery({ source, active, openedId, onActive, onOpen, onClose, s
     tiles.push(
       <Tile key={item?.id ?? `i${i}`} item={item} index={i} count={source.count} x={PAD + c * (TILE_W + GAP)} y={PAD + r * STRIDE}
         active={i === active} opened={!!item && item.id === openedId} showScore={showScore} eager={!scrolling} idBase={idBase}
+        sub={item && subtitle ? subtitle(item) : undefined}
         onPick={(k) => {
           onActive(k);
           onOpen(k);

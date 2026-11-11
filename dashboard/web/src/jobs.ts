@@ -5,7 +5,9 @@ import {
   api, errorText, useJobEvents, type JobEvent, type JobItem, type JobKind, type JobList, type JobStatus, type JobView,
 } from './api.ts';
 
-export const KIND_LABEL: Record<JobKind, string> = { sort: 'Sort', group: 'Group', index: 'Index', undo: 'Undo', apply: 'Apply preview' };
+export const KIND_LABEL: Record<JobKind, string> = {
+  sort: 'Sort', group: 'Group', index: 'Index', undo: 'Undo', apply: 'Apply preview', faces: 'Face tagging', 'faces-setup': 'Face worker setup',
+};
 
 export const STATUS: Record<JobStatus, { label: string; tone: 'ok' | 'warn' | 'bad' | 'muted' | 'run' }> = {
   queued: { label: 'Waiting', tone: 'muted' },
@@ -24,7 +26,7 @@ export function jobTitle(j: Pick<JobView, 'kind' | 'params'>): string {
   const a = j.params.action;
   if (j.kind === 'undo') return j.params.dryRun ? 'Undo preview' : 'Undo';
   if (j.kind === 'apply') return a === 'copy' ? 'Apply preview (copy)' : 'Apply preview';
-  if (j.kind === 'index') return 'Index';
+  if (j.kind === 'index' || j.kind === 'faces' || j.kind === 'faces-setup') return KIND_LABEL[j.kind];
   return a === 'report' ? `${KIND_LABEL[j.kind]} preview` : `${KIND_LABEL[j.kind]} (${String(a)})`;
 }
 
