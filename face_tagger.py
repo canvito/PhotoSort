@@ -31,8 +31,9 @@ from datetime import datetime
 from pathlib import Path
 
 import runctl
-from face_worker import PROTOCOL, FaceTaggingError, InsightFaceBackend, decode_embedding, read_frame, write_frame
-from media import VideoError, frame_pngs, video_targets
+from face_worker import (OPTIONAL_FACE_FIELDS, PROTOCOL, FaceTaggingError, InsightFaceBackend, decode_embedding,
+                         read_frame, write_frame)
+from media import VideoError, frame_pngs, people_dirs, video_targets
 
 __all__ = ["FaceTaggingError", "InsightFaceBackend", "WorkerPool", "format_face_report", "parse_workers",
            "setup_remote_worker", "tag_people"]
@@ -299,7 +300,8 @@ class WorkerConnection:
             raise FaceTaggingError(f"{self.label}: no reply within {timeout:.0f}s") from None
         if "error" in reply:
             raise FaceTaggingError(f"{self.label}: {reply['error']}")
-        return [{"embedding": decode_embedding(f["embedding"]), "bbox": f["bbox"]} for f in reply.get("faces", [])]
+        return [{"embedding": decode_embedding(f["embedding"]), "bbox": f["bbox"],
+                 **{k: f[k] for k in OPTIONAL_FACE_FIELDS if k in f}} for f in reply.get("faces", [])]
 
     def terminate(self) -> None:
         if self.process is not None and self.process.poll() is None:
@@ -610,13 +612,14 @@ def _reference_people(people_dir: Path, image_exts: set[str], backend) -> dict[s
 
 def _image_paths(source: Path, image_exts: set[str], recursive: bool, output: Path, people_dir: Path,
                  limit: int) -> list[Path]:
-    paths = source.rglob("*") if recursive else source.iterdir()
+    listing = sorted(source.rglob("*") if recursive else source.iterdir())
+    crops = people_dirs(listing)  # folders of face crops (faces-discover) are not photos to tag
     result = []
-    for path in sorted(paths):
+    for path in listing:
         if not path.is_file() or path.suffix.lower() not in image_exts or path.resolve() == output:
             continue
         resolved = path.resolve()
-        if resolved == people_dir or people_dir in resolved.parents:
+        if resolved == people_dir or people_dir in resolved.parents or crops.intersection(resolved.parents):
             continue
         result.append(path)
     return result[:limit or None]

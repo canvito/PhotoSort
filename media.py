@@ -30,6 +30,9 @@ VIDEO_EXTS = ({".mov", ".mp4", ".m4v", ".3gp", ".avi", ".mkv", ".webm", ".wmv", 
 # a larger context would make PAIR nodes reload the model.
 VIDEO_FRAMES = 8
 FACE_FRAME_SPACING_S = 1.0
+# faces-discover writes this file into the folder of face crops it makes; every scan (sort --recursive, group,
+# index, faces) leaves such a folder and everything under it alone.
+PEOPLE_MARKER = "_photosort_people.json"
 _TRANSPOSE = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
 
 
@@ -39,6 +42,11 @@ class VideoError(RuntimeError):
 
 def is_video(path) -> bool:
     return Path(path).suffix.lower() in VIDEO_EXTS
+
+
+def people_dirs(listing) -> set[Path]:
+    """Folders of face crops among a scan's `listing` of paths: the ones that hold a PEOPLE_MARKER file."""
+    return {Path(p).parent.resolve() for p in listing if Path(p).name == PEOPLE_MARKER}
 
 
 def encode_pil(im: Image.Image, max_side: int) -> str:

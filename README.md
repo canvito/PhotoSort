@@ -2,26 +2,30 @@
 
 Sorts photos, screenshots and videos into bucket folders (people, food, screenshot_chat, …), gathers the ones
 that match a plain-language request ("birthday party last Sunday") into one folder, finds them by
-plain-language search, and tags faces, using **local models only**. Model requests go to the NVIDIA PAIR
+plain-language search, tags faces, and finds the different people in a folder of photos (one folder of face
+crops per person, ready to rename), using **local models only**. Model requests go to the NVIDIA PAIR
 (Personal AI Router) Ollama proxy on this PC (`http://127.0.0.1:11434`), which spreads them across the PAIR
 cluster on the LAN. This PC itself does not run models (its Ollama engine is off in PAIR; see
 [Cluster nodes](#model-choice-benchmark-2026-11-09)).
 
 **Privacy (standing rule):** photos, screenshots, videos and anything derived from them (video frames, faces,
 captions, visible text, embeddings, the search index) never go to a cloud LLM or cloud service. This covers sorting, grouping, search
-indexing, search queries and face tagging. A `group` request is your own text, and it too goes only to the local models. It is enforced in code (`local_only.py`): PhotoSort refuses any
+indexing, search queries, face tagging and finding people (`faces-discover`). A `group` request is your own text, and it too goes only to the local models. It is enforced in code (`local_only.py`): PhotoSort refuses any
 non-loopback `base_url`, ignores system/env HTTP proxies, and refuses Ollama cloud models (names ending
 `-cloud`/`:cloud`, or models that PAIR lists with `remote_host`/`remote_model`), both when the config or
 `--model` names one and at preflight before any photo is sent. OneDrive is the one cloud service involved, and
 only as storage: the photos already live there, so OneDrive syncs what PhotoSort does inside a synced folder,
 namely the bucket and group folders, the moved files, `_photosort_journal.jsonl` (file paths, bucket and
-confidence) and a group folder's `_photosort_group.json` (your request). The search index stays outside OneDrive
-(and `index-export` refuses to write a copy into OneDrive unless you add `--allow-onedrive`).
+confidence), a group folder's `_photosort_group.json` (your request) and, if the folder you give `faces-discover`
+is inside OneDrive, its face crops (faces cut out of your photos) and `_photosort_people.json`. The search index
+stays outside OneDrive (and `index-export` refuses to write a copy into OneDrive unless you add
+`--allow-onedrive`).
 See [Privacy audit](#privacy-audit) for the last check and how to repeat it.
 
-The [Dashboard](#dashboard-dashboardps1), a desktop window, runs sort, group, index, apply and undo for you, with
-live progress, and searches and browses the index with thumbnails (faces come in a later phase). Start it with
-`.\dashboard.ps1` and stop it with `.\dashboard.ps1 stop`.
+The [Dashboard](#dashboard-dashboardps1), a desktop window, runs sort, group, index, apply, undo and face tagging
+for you, with live progress, searches and browses the index with thumbnails, and edits the settings.
+`faces-discover` is command-line only for now. Start the dashboard with `.\dashboard.ps1` and stop it with
+`.\dashboard.ps1 stop`.
 
 ## Setup (once)
 
@@ -85,8 +89,9 @@ Behavior:
 - `--recursive` takes the photos and videos from every subfolder and moves them into the one set of buckets
   at the source (or `--dest`) root; subfolders do not get buckets of their own. Only bucket folders at that
   root are skipped, so bucket folders left inside subfolders by earlier per-folder sorts are re-sorted into
-  the root buckets. Group folders made by `group` (they hold a `_photosort_group.json` marker) are always
-  skipped. Other files stay in their subfolders; emptied subfolders are kept.
+  the root buckets. Group folders made by `group` (they hold a `_photosort_group.json` marker) and people
+  folders made by `faces-discover` (a `_photosort_people.json` marker) are always skipped. Other files stay in
+  their subfolders; emptied subfolders are kept.
 - Sorting moves/copies files without opening or re-encoding their content; photo and video bytes,
   including EXIF and video metadata, are preserved. A cross-volume move may have normal filesystem-metadata
   differences.
@@ -109,9 +114,11 @@ Behavior:
   without asking the model again. A preview records each file's size, modified time and SHA-256; a file that
   changed or is gone since then is left alone and counted as `changed` (exit code 1). `undo` reverts an apply
   like any other run.
-- **One run per folder:** a run that moves or copies files (`sort`, `group`, `apply`, `undo`) refuses to start while
+- **One run per folder:** a run that moves or copies files (`sort`, `group`, `apply`, `undo`, and `faces-discover`
+  for the people folder it writes) refuses to start while
   another PhotoSort run uses an overlapping folder, and runs that only read (`--action report`, `index`, `faces`,
-  `undo --dry-run`) refuse while one is moving files there. The message names the other run; `--force` runs
+  `faces-discover --dry-run`, `undo --dry-run`) refuse while one is moving files there. The message names the
+  other run; `--force` runs
   anyway. Lock files live in `%LOCALAPPDATA%\PhotoSort\locks` and are ignored once their process has ended.
 - `--events FILE` and `--cancel-file FILE` (before the command) are for the dashboard: progress as JSON lines,
   and a safe stop once the file exists. Without them nothing changes in the output.
@@ -208,7 +215,7 @@ How it works:
 
 Behavior:
 - `group` looks in the folder and all its subfolders, including bucket folders from `sort`. It skips group
-  folders, and `sort --recursive` skips them too.
+  folders and people folders from `faces-discover`, and `sort --recursive` skips them too.
 - Every checked file is journaled in `_photosort_journal.jsonl` in the folder: capture time and where it came
   from, match and confidence, `matched_by` (`topic`, `same event` or `dates`) and `near_match` (asked the
   same-occasion question). `undo` moves the files back and removes the emptied group folder. Moves update the
@@ -248,7 +255,8 @@ Accuracy and speed (2026-11-10, `gemma4:12b` through PAIR; public images and mad
 scene, visible text and a people count (a video is described from 8 frames as a whole). A local embedding
 model (`qwen3-embedding:8b`) turns that description into vectors. `search` embeds your query the same way
 and ranks files by similarity. Both talk only to the local PAIR proxy, and files are only read, never
-modified.
+modified. Folders of face crops made by `faces-discover` (they hold a `_photosort_people.json` marker) are not
+indexed: they are pieces of your photos, not part of the library.
 
 ```powershell
 # Build or refresh the index (always includes subfolders; re-runs only process new or changed photos)
@@ -437,7 +445,8 @@ The worker uses CUDA when ONNX Runtime exposes it and otherwise uses CPU.
 
 ### Reference people and running
 
-Create one reference subfolder per person; each reference image must contain exactly one clear face:
+Create one reference subfolder per person; each reference image must contain exactly one clear face (or let
+[`faces-discover`](#find-the-people-in-a-folder-faces-discover) build these folders for you):
 
 ```text
 D:\PhotoSort\people\
@@ -478,6 +487,98 @@ time, so only that video is reported as an error.
 **Model terms:** [InsightFace's Python library is MIT-licensed](https://github.com/deepinsight/insightface/blob/master/python-package/README.md#license),
 but its provided pretrained model weights are restricted to non-commercial research use. This model
 pack is intended for personal/non-commercial use; review the model license before commercial use.
+
+### Find the people in a folder (`faces-discover`)
+
+`faces` needs a folder of reference photos for each person. `faces-discover` builds those folders: it finds the
+faces in your photos (subfolders included), groups the faces that belong to the same person, and writes one folder
+of face crops per person, named `person-001`, `person-002`, … with the most-photographed person first. You rename
+each folder to the person's name, delete any that are not people you want, and use the result as `--people`.
+Nothing is trained, and nothing leaves your machines.
+
+```powershell
+# 1. Look first: counts only, writes nothing
+.\photosort.cmd faces-discover "<photos folder>" --people "<new folder for the people>" --dry-run
+# 2. Write one folder of crops per person (the people folder must be new or empty)
+.\photosort.cmd faces-discover "<photos folder>" --people "<new folder for the people>"
+# 3. Rename the person-NNN folders to names, then tag faces with them
+.\photosort.cmd faces "<photos folder>" --people "<new folder for the people>" --recursive
+```
+
+**Can the model crop?** The detector in `buffalo_l` (SCRFD) returns each face's box and five landmarks (eyes, nose,
+mouth corners). The crop itself is ordinary image code (Pillow) on this PC. No vision LLM is involved.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--people FOLDER` | required | Where the person folders go. It must be new or empty, and neither inside the photos folder nor containing it, so that nothing you renamed is ever overwritten |
+| `--similarity S` | `0.35` | How alike two groups of faces must be, on average, to count as one person. Lower merges people; higher splits one person into several folders |
+| `--min-photos N` | `3` | A person needs at least N different photos with a clear face; smaller groups are left out (and counted) |
+| `--max-per-person N` | `16` | Crops per person: the clearest and most different; `0` = one per photo |
+| `--dry-run` | off | Find the people and report counts; write nothing (no crops are made) |
+| `--limit N` | `0` | Only the first N photos, for a trial |
+| `--workers`, `--model`, `--model-dir` | as `faces` | Face workers (default `face_workers`) |
+
+How it works:
+1. **Scan:** every photo under the folder, including subfolders and bucket folders. Photos only for now; videos
+   are skipped. Folders of crops from an earlier run (they hold a `_photosort_people.json` marker) are skipped.
+2. **Detect:** the face workers (the same ones `faces` uses) find the faces and their embeddings, 2,000 photos at
+   a time. Only clear faces are compared: detector confidence of at least 0.6, a face at least 64 px across, and
+   looking at the camera (nose within about half the eye distance of the middle, roughly 45°). A stranger in the
+   background or a profile is not assigned to anybody; the report counts these by reason.
+3. **Group:** average-linkage clustering of the embeddings (numpy; exact, cut at `--similarity`). The embeddings
+   exist only in memory, and nothing is stored. Above 10,000 clear faces, the clearest 10,000 are compared (the
+   report says so). At most 200 people are written.
+4. **Choose crops:** per person, one face per photo, preferring clear, front-facing faces that are typical of
+   that person, but unlike the ones already chosen, so the folder shows different angles and light.
+5. **Cut and check:** a square around the face (a 40% margin on each side; 20% and 60% are tried if the first
+   fails), as a JPEG (quality 95, at most 512 px, **no EXIF, GPS or date metadata**). Each crop is sent back to a
+   worker, and is kept only if it holds exactly one face, and it is the same face it was cut from (cosine
+   similarity of at least 0.75). `faces` refuses a reference picture without exactly one face, so a crop that
+   fails is replaced by the person's next-best face, or left out; the report counts these.
+6. **Write:** only after everything is checked, all the folders are written together with a marker file,
+   `_photosort_people.json` (format, model and settings; no embeddings, no file names). If writing fails, what
+   the run made is removed again. A crop is named after its photo (`<photo name>.jpg`; `-2`, `-3` if two photos
+   share a name).
+
+The report has counts only, never file names: photos scanned, faces found and compared (and which were left
+out, by reason), the people found, **`Cut-offs`** (how many people each similarity from 0.25 to 0.50 would give),
+crops written, people who **may be the same person** (centroids at least 0.40 alike), duration and workers.
+
+Tuning (re-running needs a new or empty folder, so it never overwrites renamed folders):
+- Read `Cut-offs`: a stretch where the number barely changes suggests a stable answer. The same person in two
+  folders (glasses, age, light)? Move the crops into one folder, or re-run with a lower `--similarity`. Two
+  people in one folder? Re-run with a higher one, or move the crops out. Moving and deleting crops is fine.
+- Children change as they grow, so one child can appear as several folders.
+- Photos of screens (chat avatars, photos of photos) and posters can form their own "people": delete them.
+- Someone seen in fewer than `--min-photos` photos with a clear face gets no folder. Lower `--min-photos` to
+  include them (more strangers appear, too).
+
+Measured (2026-11-11; 1,762 photos, 6.3 GB; `spark1:16` over gigabit): the dry run took 84 s (about 1,250
+photos/min) and the real run 102 s, which sent 587 more images for the one-face check. 808 photos had faces;
+2,477 faces were found and 2,077 were clear enough to compare. At the default 0.35 that gave 62 people (`Cut-offs`:
+56 to 66 for 0.25 to 0.50) and 444 crops in 61 folders: one person's crops all failed the one-face check, so that
+person got no folder (the report lists such a person with 0 crops). Using the 444 crops as `--people` passed the
+reference check of `faces` (exactly one face in each).
+
+Privacy and runs:
+- Photos are only read, and go only to the face workers over SSH (LAN, as for `faces`); crops go to the workers
+  the same way for the one-face check. No cloud model or service sees any of it.
+- PAIR is not involved: it only routes LLM engines, and nothing here is one, so nothing shows in PAIR's
+  dashboard or log while this runs (checked in PAIR's log: no `/api/chat` or `/api/embed` request during a real
+  run, only its usual `/api/tags` polling). The `Worker` lines of the report show where the work ran, for
+  example `spark1 (spark1, CUDAExecutionProvider, 16 threads)`, which is the GPU of that machine, 16 photos at a
+  time. Other PAIR machines are not used because only workers that accept SSH can be (see
+  [Where detection runs](#where-detection-runs-face-workers)).
+- The crops are pieces of your photos and show faces. If the folder is in OneDrive, OneDrive syncs it like your
+  photos. Put it somewhere else (any local folder) if you do not want that.
+- The scan takes a read lock on the photos folder and, unless `--dry-run`, a move lock on the people folder
+  (the "One run per folder" rule under [Usage](#usage)). `--events` and `--cancel-file` work as for other
+  commands. A stop (Ctrl+C or cancel) before the writing starts writes nothing; once writing has started it
+  finishes first, so the folder is never half-written. Exit code: 0 = done, 1 = a photo could not be read or
+  nobody was found, 2 = setup or option error (for example, a people folder that is not new or empty), 130 =
+  stopped.
+- After renaming, keep `_photosort_people.json` in the folder: it is what keeps `sort --recursive`, `group`,
+  `index` and `faces` from treating the crops as photos.
 
 ## Dashboard (`dashboard.ps1`)
 
@@ -759,7 +860,7 @@ use the CLI. To add it later, decide that first: it loosens the privacy rules ab
 | `max_side` | `1024` | Images are downscaled in memory before sending; originals untouched |
 | `timeout_s`, `retries` | `300`, `3` | Per-request timeout and retry count |
 | `action` | `move` | Default action for `sort` and `group`: `move`, `copy` or `report` |
-| `face_workers` | `["spark1:16"]` | Where `faces` runs detection: SSH `HOST[:THREADS]` and/or `local[:THREADS]`; `--workers` overrides |
+| `face_workers` | `["spark1:16"]` | Where `faces` and `faces-discover` run detection: SSH `HOST[:THREADS]` and/or `local[:THREADS]`; `--workers` overrides |
 | `caption_model` | `gemma4:12b` | Vision model that describes photos for `index` |
 | `embed_model` | `qwen3-embedding:8b` | Embedding model for photo descriptions and search queries |
 | `index_concurrency` | `12` | Parallel caption requests for `index` (measured fastest); `--concurrency` overrides |
@@ -857,6 +958,13 @@ pages rerun the PAIR routing count below and list the dashboard's open connectio
 or model call. `index-export` refuses OneDrive folders unless you add `--allow-onedrive`, and its file holds your
 photos' captions and visible text, so keep it on a USB drive or a local folder and delete it after importing.
 
+**Since the audit, `faces-discover`** (see [Find the people in a folder](#find-the-people-in-a-folder-faces-discover))
+sends photos, and the crops it cuts from them for its one-face check, only to the face workers, over the same SSH
+tunnel as `faces` (a worker host on a public address is refused). It stores no
+embeddings, writes the crops only to the folder you name, and prints counts, never file names. The crops are
+faces cut out of your photos: if that folder is in OneDrive they sync with it, so choose a local folder if you
+do not want that.
+
 To recheck PAIR routing at any time, count requests by target. Every target should be a `192.168.x.x` node,
 `cluster` (PAIR's own model list) or blank (a request that was never routed):
 
@@ -894,12 +1002,29 @@ Get-Content "$env:LOCALAPPDATA\NVIDIA Corporation\Personal AI Router\logs\nvpair
   `.\photosort.cmd faces-setup HOST`. Check SSH itself with `ssh -o BatchMode=yes HOST hostname`
   (it must not prompt). If one of several workers fails, the run continues on the others and the report
   lists it as failed. Workers stop when their SSH session ends, so nothing keeps GPU memory after a run.
+- `faces-discover` says "the people folder must be new or empty": it never writes into a folder that already has
+  something in it, so that nothing you renamed is overwritten. Give a new folder (or one you emptied), or copy
+  your renamed folders out first. "…must be separate folders": the people folder cannot be inside the photos
+  folder, nor contain it.
+- `faces-discover` finds nobody (exit 1) or too few people: look at the report's `Faces` line for what was left
+  out (small, turned away, low confidence) and at `Cut-offs`. Try a lower `--similarity` or `--min-photos` with
+  `--dry-run`, which writes nothing, before a real run into a new folder.
+- A `person-NNN` folder holds a stranger, a chat avatar or a poster: delete it. Two folders are one person: move
+  the crops together (the report's "May be the same person" lists likely pairs).
+- `faces` says a reference picture does not have exactly one face: a crop was edited, or replaced by hand with
+  a picture that has none or several faces. Crops written by `faces-discover` always pass that check when made.
 
 ## Tests
 
 ```powershell
 C:\Users\<you>\miniconda3\envs\utils\python.exe -m pytest -q tests   # or: python -m pytest -q tests (env activated)
 ```
+
+`faces-discover` is tested with a stand-in face worker (`FakeDiscoverBackend` in `tests\test_photosort.py`) that
+finds solid coloured squares on a grey photo, one colour per person: the clustering is compared with a textbook
+average-linkage on random vectors; quality gates, crop geometry and metadata stripping, the one-face check (with
+a photo that fails every margin), the new-or-empty folder rules, the all-or-nothing write, the dry run and the
+marker skip in `sort`, `group`, `index` and `faces` are checked on a small synthetic library.
 
 Dashboard (after `.\dashboard.ps1 setup -Fixture -Yes`), with its private Node.js:
 

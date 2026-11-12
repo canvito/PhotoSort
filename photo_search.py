@@ -23,7 +23,7 @@ import requests
 
 import runctl
 from local_only import require_local_models, require_loopback
-from media import is_video, video_jpegs
+from media import is_video, people_dirs, video_jpegs
 
 log = logging.getLogger("photosort.search")
 
@@ -287,7 +287,11 @@ def index_folder(cfg: dict, source: Path, client, image_exts: Iterable[str], lim
         raise FileNotFoundError(f"source folder not found: {source}")
     exts = {e.lower() for e in image_exts}
     runctl.emit("phase", name="scan")
-    files = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+    listing = sorted(source.rglob("*"))
+    files = [p for p in listing if p.is_file() and p.suffix.lower() in exts]
+    crops = people_dirs(listing)  # folders of face crops (faces-discover) are not part of the library
+    if crops:
+        files = [p for p in files if not crops.intersection(p.resolve().parents)]
     current = {str(p) for p in files}
     current_nc = {os.path.normcase(p) for p in current}
     files = files[: limit or None]

@@ -35,6 +35,9 @@ except ImportError:
     pass
 
 PROTOCOL = 1
+# Besides bbox and embedding, a detected face may carry its detector confidence and five landmarks. Workers
+# without them still work (PROTOCOL stays 1); only faces-discover uses them, and copes when they are missing.
+OPTIONAL_FACE_FIELDS = ("score", "kps")
 _FRAME = struct.Struct(">II")
 MAX_HEADER_BYTES = 1 << 20
 MAX_PAYLOAD_BYTES = 512 << 20
@@ -85,10 +88,15 @@ class InsightFaceBackend:
             embedding = getattr(face, "normed_embedding", None)
             if embedding is None:
                 embedding = face.embedding
-            observations.append({
+            observation = {
                 "embedding": embedding,
                 "bbox": [round(float(v), 1) for v in face.bbox],
-            })
+            }
+            if face.det_score is not None:  # detector confidence
+                observation["score"] = round(float(face.det_score), 3)
+            if face.kps is not None:  # five landmarks: eyes, nose, mouth corners (faces-discover judges the pose)
+                observation["kps"] = [[round(float(x), 1), round(float(y), 1)] for x, y in face.kps]
+            observations.append(observation)
         return observations
 
 
@@ -170,7 +178,8 @@ def _serve_requests(inp, out, threads: int, backends: list) -> None:
         reply = {"type": "result", "id": header.get("id")}
         backend = idle.get()
         try:
-            reply["faces"] = [{"bbox": f["bbox"], "embedding": encode_embedding(f["embedding"])}
+            reply["faces"] = [{"bbox": f["bbox"], "embedding": encode_embedding(f["embedding"]),
+                               **{k: f[k] for k in OPTIONAL_FACE_FIELDS if k in f}}
                               for f in backend.detect(payload)]
         except Exception as e:  # one bad image must not stop the worker
             reply["error"] = f"{type(e).__name__}: {str(e)[:200]}"

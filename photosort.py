@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import date, datetime
 from pathlib import Path
 
@@ -27,10 +28,12 @@ from PIL import Image, ImageOps
 
 import group
 import runctl
+from face_discover import (DEFAULT_MAX_PER_PERSON, DEFAULT_MIN_PHOTOS, DEFAULT_SIMILARITY, discover_people,
+                           format_discover_report)
 from face_tagger import FaceTaggingError, format_face_report, parse_workers, setup_remote_worker, tag_people
 from index_transfer import export_index, format_export_report, format_import_report, import_index
 from local_only import LocalOnlyError, require_local_models, require_loopback, under_onedrive
-from media import VIDEO_EXTS, VideoError, encode_pil, is_video, video_jpegs
+from media import PEOPLE_MARKER, VIDEO_EXTS, VideoError, encode_pil, is_video, people_dirs, video_jpegs
 from photo_search import (PairSearchClient, SearchError, index_folder, index_path, search_index, settings,
                           sha256_file, update_index_paths)
 from runctl import LockError
@@ -262,11 +265,14 @@ class Classifier:
 
 def scan(source: Path, dest: Path, buckets, recursive: bool) -> tuple[list[Path], int]:
     """Return (photos and videos to sort, count of other files). Files already in bucket folders, and everything
-    in group folders, are ignored."""
-    skip_dirs = {(dest / b).resolve() for b in buckets} | (group.group_dirs(source) if recursive else set())
+    in group folders and in folders of face crops (faces-discover), are ignored."""
+    listing = sorted(source.rglob("*") if recursive else source.iterdir())
+    skip_dirs = {(dest / b).resolve() for b in buckets}
+    if recursive:
+        skip_dirs |= group.group_dirs(source) | people_dirs(listing)
     images, skipped = [], 0
-    for p in sorted(source.rglob("*") if recursive else source.iterdir()):
-        if not p.is_file() or p.name in (JOURNAL_NAME, group.GROUP_MARKER):
+    for p in listing:
+        if not p.is_file() or p.name in (JOURNAL_NAME, group.GROUP_MARKER, PEOPLE_MARKER):
             continue
         if skip_dirs.intersection(p.resolve().parents):
             continue
@@ -1106,6 +1112,18 @@ def _run(a: argparse.Namespace) -> tuple[int, dict | None, str | None]:
         report = format_face_report(result)
         print(report, flush=True)
         return (1 if result["summary"]["errors"] else 0), result["summary"], report
+    if a.cmd == "faces-discover":
+        workers = a.workers or load_config(a.config).get("face_workers") or ["local"]
+        with ExitStack() as locks:
+            locks.enter_context(runctl.folder_lock("faces-discover", "read", [a.source], a.force))
+            if not a.dry_run:  # only a real run writes, and nothing else may touch the new folder meanwhile
+                locks.enter_context(runctl.folder_lock("faces-discover", "move", [a.people], a.force))
+            result = discover_people(a.source, a.people, IMAGE_EXTS, a.similarity, a.min_photos, a.max_per_person,
+                                     a.limit, a.dry_run, a.model, a.model_dir, workers=workers)
+        report = format_discover_report(result)
+        print(report, flush=True)
+        found = result["people"] if a.dry_run else result["crops"]
+        return (1 if result["errors"] or not found else 0), result, report
     cfg = load_config(a.config)
     if a.cmd in ("index-export", "index-import"):
         if a.cmd == "index-export":
@@ -1242,6 +1260,26 @@ def main(argv=None) -> int:
                    help="minimum lead over the second-best person; ambiguous matches remain unknown")
     f.add_argument("--recursive", action="store_true", help="include subfolders")
     f.add_argument("--limit", type=int, default=0, help="only process the first N files")
+    fd = sub.add_parser("faces-discover", parents=[locked],
+                        help="find the different people in photos (always including subfolders) and write one "
+                             "folder of face crops per person, to rename and use as the --people folder of `faces`")
+    fd.add_argument("source", type=Path, help="folder of photos to look in; originals are not modified")
+    fd.add_argument("--people", type=Path, required=True,
+                    help="new or empty folder to write the person folders into (outside the photos folder)")
+    fd.add_argument("--similarity", type=float, default=DEFAULT_SIMILARITY,
+                    help="how alike two groups of faces must be, on average, to be one person (default "
+                         "%(default)s); lower merges people, higher splits one person into several")
+    fd.add_argument("--min-photos", type=int, default=DEFAULT_MIN_PHOTOS,
+                    help="a person needs at least this many photos with a clear face (default %(default)s)")
+    fd.add_argument("--max-per-person", type=int, default=DEFAULT_MAX_PER_PERSON,
+                    help="crops per person, the clearest and most different (default %(default)s; 0 = every photo)")
+    fd.add_argument("--dry-run", action="store_true",
+                    help="find the people and report counts; write nothing")
+    fd.add_argument("--limit", type=int, default=0, help="only look at the first N photos")
+    fd.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")
+    fd.add_argument("--model-dir", type=Path, help="InsightFace root for a `local` worker (default: ~/.insightface)")
+    fd.add_argument("--workers", help="where detection runs: comma-separated HOST[:THREADS] SSH hosts "
+                                      "(default: face_workers in config.json)")
     fs = sub.add_parser("faces-setup", help="install the face worker environment and model on SSH hosts")
     fs.add_argument("hosts", nargs="+", help="SSH host aliases, e.g. spark1")
     fs.add_argument("--model", choices=["buffalo_l"], default="buffalo_l")

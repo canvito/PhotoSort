@@ -7,7 +7,7 @@ as any feature, config or procedure change.
 
 - **Standing rule: no cloud model or cloud service ever reads the user's photos, screenshots or videos, or
   anything derived from them** (image bytes, video frames, faces, captions, visible text, embeddings, the
-  search index). This applies to every command (`sort`, `group`, `index`, `search`, `faces`) and to you, the agent:
+  search index). This applies to every command (`sort`, `group`, `index`, `search`, `faces`, `faces-discover`) and to you, the agent:
   do not view/attach personal images, videos or frames; when inspecting them, print numbers only. Bucket sorting, group request reading and matching, search captioning/embedding and search queries go only to the local PAIR
   Ollama proxy at `http://127.0.0.1:11434`, using models running on the user's own machines; face detection
   only to `local` or LAN SSH face workers. Never weaken or bypass the code guard (`local_only.py`): it
@@ -26,7 +26,8 @@ as any feature, config or procedure change.
   `%LOCALAPPDATA%\PhotoSort\search_index.sqlite`; keep it out of OneDrive and git. It can be rebuilt by
   running `index` again, or brought from another PC with `index-export`/`index-import` (see Search below).
 - **File names and per-file results never reach you.** On the user's folders, `sort`, `group`, `index`,
-  `faces`, `apply` and `undo` log one line per file (name plus bucket, MATCH/no or error) to stderr, and the finish
+  `faces`, `faces-discover`, `apply` and `undo` log one line per file (name plus bucket, MATCH/no or error) to
+  stderr, and the finish
   report goes to stdout (counts only). Send stderr to a local log outside OneDrive and the repo, and show only
   the report. For example:
   `.\photosort.cmd sort "<folder>" 2> "$env:LOCALAPPDATA\PhotoSort\logs\sort-<yyyyMMdd-HHmm>.log"`
@@ -103,9 +104,11 @@ finish report).
   are not asked). Nothing moves until both passes finish. That prompt says yes to most other events too (75/110),
   so it must stay limited to files near a match. Measured: 22/22 parties yes, 8/8 unrelated photos no, thing
   topics 7/7 targets yes and 77/77 others no. Journal entries carry `matched_by` and `near_match`.
-- `group` looks in all subfolders, including bucket folders, and skips group folders (marker
-  `_photosort_group.json`); `sort --recursive` skips them too. After a preview, `apply` on the folder's journal
-  moves exactly the previewed matches without asking the model again. Undo with `undo` on the folder's journal.
+- `group` looks in all subfolders, including bucket folders. It skips group folders (marker
+  `_photosort_group.json`) and people folders made by `faces-discover` (marker `_photosort_people.json`);
+  `sort --recursive` skips both kinds, and `index` and `faces` skip people folders. After a preview, `apply` on
+  the folder's journal moves exactly the previewed matches without asking the model again. Undo with `undo` on
+  the folder's journal.
 - Report: what was understood, group folder, files scanned / in range / other dates / no capture date, checked
   (and asked about the same occasion), found (photos, videos), errors, duration, files/min (all in the finish
   report).
@@ -162,6 +165,39 @@ spark1 is already set up (`~/.photosort/venv`, model in `~/.insightface/models/b
 New worker host (Linux/macOS with SSH enabled + key alias): `.\photosort.cmd faces-setup HOST`.
 "face worker environment not found" also means: run `faces-setup HOST`. Worker code is redeployed
 automatically when it changes; no manual copy needed.
+
+### Find the different people in a folder (`faces-discover`)
+
+Builds the `--people` folder for `faces`: one folder of face crops per person, for the user to rename. Photos
+only (videos skipped), always recursive, same workers as `faces` (spark1 over SSH; never `local`). The detector
+(SCRFD) gives boxes and landmarks and Pillow does the cropping, so no vision LLM is involved.
+
+```powershell
+.\photosort.cmd faces-discover "<photos>" --people "<new folder>" --dry-run   # counts only, writes nothing
+.\photosort.cmd faces-discover "<photos>" --people "<new folder>"             # --similarity 0.35 --min-photos 3 --max-per-person 16 --limit N
+```
+
+- Agent rules: run `--dry-run` first, then the real run into a folder the user named (it must be new or empty
+  and separate from the photos; ask, never guess). Stderr goes to a local log as above (`cannot read <name>` lines
+  hold file names: count them, never print them). Show only the stdout report (counts: photos, faces, clear
+  enough, people per similarity under `Cut-offs`, crops, `May be the same person` pairs with their folder
+  names, duration). **Never view, attach, list or print the crops or their names**: they are faces cut out of the
+  user's photos. Count folders and files only, e.g. `(Get-ChildItem <people> -Directory).Count`.
+- Calibrate `--similarity` (default 0.35, lower merges people, higher splits one person) from the `Cut-offs`
+  line and the `May be the same person` hints; do not guess from the images. Changing it means a new or empty
+  folder: a run never writes into a non-empty folder, so renamed folders are never overwritten. Do not
+  delete or empty a people folder yourself; the user renames and prunes it.
+- Each crop is sent back to a worker before it is written and kept only if it holds exactly one face, the same
+  one it was cut from (cosine ≥ 0.75): `faces` (`_reference_people`) aborts a whole run when any reference
+  picture has no face or more than one. The write is all or nothing, with `_photosort_people.json` written last.
+  That marker keeps `sort --recursive`, `group`, `index` and `faces` away from the folder (they treat it as
+  crops, not photos); do not delete it, and keep the folder outside the photos folder.
+- The people folder may be inside OneDrive (the user chose that for `_faces`), and then the crops sync like the
+  photos. Say so in the final message; recommend a local folder if the user would rather not sync them.
+- Verify a real run with `faces` using the new folder as `--people` (`--recursive`, `--output` a local file outside
+  OneDrive and the repo) and read only its finish-report counts.
+- Not in the dashboard yet (CLI only). Exit codes: 0 done, 1 unreadable photos or nobody found, 2 setup or
+  option error (not new or empty, inside the photos, bad value), 130 stopped.
 
 ## Dashboard (`dashboard.ps1`, phases P0–P4 done)
 

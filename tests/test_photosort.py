@@ -11,9 +11,11 @@ import sys
 import threading
 import time
 import zlib
+from collections import Counter
 from datetime import date, datetime
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,6 +24,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import photosort  # noqa: E402
 import photo_search  # noqa: E402
+import face_discover  # noqa: E402
 import face_tagger  # noqa: E402
 import face_worker  # noqa: E402
 import group  # noqa: E402
@@ -299,7 +302,8 @@ class FakeWorkerBackend:
     def detect(self, payload):
         if payload == b"corrupt":
             raise ValueError("cannot identify image")
-        return [{"bbox": [1, 2, 3, 4], "embedding": [0.6, 0.8]}]
+        return [{"bbox": [1, 2, 3, 4], "embedding": [0.6, 0.8], "score": 0.9,
+                 "kps": [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]}]
 
 
 def _run_in_thread(target, *args):
@@ -326,6 +330,7 @@ def test_worker_protocol_round_trip_over_pipes():
         faces = conn.detect(b"jpeg bytes")
         assert faces[0]["bbox"] == [1, 2, 3, 4]
         assert faces[0]["embedding"] == pytest.approx([0.6, 0.8])
+        assert faces[0]["score"] == 0.9 and faces[0]["kps"][2] == [5, 6]  # faces-discover judges clarity and pose
         with pytest.raises(face_tagger.FaceTaggingError, match="cannot identify image"):
             conn.detect(b"corrupt")
         assert conn.alive  # one bad image does not take the worker down
@@ -399,6 +404,305 @@ def test_worker_pool_retries_on_another_worker_and_preserves_order(tmp_path):
     assert summary["local"]["images"] == 6 and summary["spark1"]["failed"] == "connection lost"
     with pytest.raises(face_tagger.NoWorkersLeft):
         face_tagger.WorkerPool([FakeConnection("spark1", dies=True)]).detect(paths[0])
+
+
+def test_insightface_backend_sends_the_detector_score_and_landmarks_when_it_has_them():
+    scored = SimpleNamespace(bbox=np.array([1.04, 2.0, 30.0, 40.0]), det_score=np.float32(0.97234),
+                             kps=np.array([[10.04, 12.0], [20.0, 12.0], [15.0, 20.0], [11.0, 28.0], [19.0, 28.0]]),
+                             normed_embedding=np.array([0.6, 0.8], np.float32))
+    bare = SimpleNamespace(bbox=np.array([1.0, 2.0, 3.0, 4.0]), det_score=None, kps=None,
+                           normed_embedding=np.array([1.0, 0.0], np.float32))
+    backend = object.__new__(face_worker.InsightFaceBackend)
+    backend._np, backend._app = np, SimpleNamespace(get=lambda image: [scored, bare])
+    png = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(png, "PNG")
+
+    with_score, without = backend.detect(png.getvalue())
+
+    assert with_score["score"] == 0.972 and with_score["kps"][0] == [10.0, 12.0] and with_score["bbox"][0] == 1.0
+    assert "score" not in without and "kps" not in without
+
+
+def _naive_upgma(vectors):
+    """Textbook average linkage, O(n^3): the similarity of each join and the groups after it."""
+    sim = vectors.astype(np.float64) @ vectors.astype(np.float64).T
+    groups, steps = [[i] for i in range(len(vectors))], []
+    while len(groups) > 1:
+        s, i, j = max((sim[np.ix_(g, h)].mean(), i, j)
+                      for i, g in enumerate(groups) for j, h in enumerate(groups) if i < j)
+        groups[i] += groups.pop(j)
+        steps.append((s, {frozenset(g) for g in groups}))
+    return steps
+
+
+def test_average_linkage_cuts_the_same_groups_as_textbook_upgma():
+    rng = np.random.default_rng(7)
+    points = np.concatenate([centre + rng.normal(scale=0.8, size=(12, 8)) for centre in rng.normal(size=(4, 8))])
+    vectors = (points / np.linalg.norm(points, axis=1, keepdims=True)).astype(np.float32)
+    n, steps = len(vectors), _naive_upgma(vectors)
+    merges = face_discover.average_linkage(vectors)
+    assert len(merges) == n - 1
+
+    def textbook(level):
+        done = [groups for s, groups in steps if s >= level]
+        return done[-1] if done else {frozenset([i]) for i in range(n)}
+
+    sims = sorted({s for s, _ in steps}, reverse=True)
+    levels = [sims[0] + 0.1, sims[-1] - 0.1] + [(a + b) / 2 for a, b in zip(sims, sims[1:]) if a - b > 1e-4]
+    assert len(levels) > 20
+    for level in levels:
+        assert {frozenset(g) for g in face_discover.cut(merges, n, level)} == textbook(level)
+    assert face_discover.average_linkage(vectors[:1]) == []
+
+
+def test_only_clear_front_facing_faces_are_compared():
+    def detection(**changes):
+        return {"embedding": [3.0, 4.0], "bbox": [0, 0, 100, 120], "score": 0.9,
+                "kps": [[30, 40], [70, 40], [50, 60], [35, 85], [65, 85]], **changes}
+
+    skipped = Counter()
+    faces = face_discover.usable_faces(5, [
+        detection(), detection(score=0.3), detection(bbox=[0, 0, 30, 30]),
+        detection(kps=[[30, 40], [70, 40], [75, 60], [35, 85], [65, 85]]),  # nose far to one side: a profile
+        detection(embedding=[0.0, 0.0]), detection(bbox=None), detection(score=float("nan")),
+        {"embedding": [1.0, 0.0], "bbox": [0, 0, 100, 100]}],  # a worker that sends neither score nor landmarks
+        skipped)
+    assert len(faces) == 2 and {f.photo for f in faces} == {5}
+    assert skipped == {"low detector confidence": 1, "too small": 1, "turned away": 1, "unreadable": 3}
+    assert np.allclose([np.linalg.norm(f.vector) for f in faces], 1.0)
+    assert face_discover.yaw([[30, 40], [70, 40], [50, 60]]) == pytest.approx(0.0)
+    assert face_discover.yaw([[30, 40], [70, 40], [75, 60]]) == pytest.approx(0.625)
+    assert face_discover.yaw(None) is None and face_discover.yaw([[1, 1], [1, 1], [2, 2]]) is None
+
+
+def test_crops_are_the_clearest_faces_but_not_near_duplicates_of_each_other():
+    def unit(*values):
+        v = np.array(values, np.float32)
+        return v / np.linalg.norm(v)
+
+    box = (0, 0, 100, 100)
+    faces = [face_discover.Face(0, box, unit(1, 0), 0.90),
+             face_discover.Face(1, box, unit(1, 0.02), 0.89),  # almost the same shot
+             face_discover.Face(2, box, unit(0.8, 0.6), 0.86),  # another angle
+             face_discover.Face(0, box, unit(1, 0.1), 0.50),  # a worse face from photo 0: one face per photo
+             face_discover.Face(3, box, unit(0.9, 0.3), 0.20)]
+    centroid = sum(f.vector for f in faces)
+    centroid /= np.linalg.norm(centroid)
+    assert face_discover.rank_faces(faces, list(range(5)), centroid, 0) == [0, 1, 2, 4]
+    assert face_discover.rank_faces(faces, list(range(5)), centroid, 3) == [0, 2, 1, 4]
+
+
+def test_people_with_alike_faces_are_listed_as_maybe_one_person():
+    def person(name, *values):
+        return face_discover.Person(name, [], 5, np.array(values, np.float32) / np.linalg.norm(values), [])
+
+    pairs = face_discover.similar_people([person("person-001", 1, 0), person("person-002", 0.95, 0.31),
+                                          person("person-003", 0, 1)])
+    assert [(a, b) for a, b, _ in pairs] == [("person-001", "person-002")]
+    assert pairs[0][2] == pytest.approx(0.95, abs=0.01)
+
+
+def test_crop_is_a_square_around_the_face_inside_the_picture_and_has_no_metadata(tmp_path):
+    assert face_discover.crop_box((100, 100, 200, 160), (800, 600), 0.4) == (60, 40, 240, 220)
+    assert face_discover.crop_box((0, 0, 50, 50), (800, 600), 0.4) == (0, 0, 90, 90)  # moved in from the edge
+    assert face_discover.crop_box((0, 0, 100, 100), (60, 40), 0.6) == (20, 0, 60, 40)  # a picture smaller than that
+    with Image.open(photo_taken(tmp_path / "taken.jpg", "2026:11:08 15:00:00")) as photo:
+        assert "exif" in photo.info
+        crop = Image.open(io.BytesIO(face_discover.render_crop(photo, (4, 4, 20, 20), 0.4)))
+    assert crop.format == "JPEG" and "exif" not in crop.info and not crop.getexif()
+    big = face_discover.render_crop(Image.new("RGB", (2400, 1800)), (200, 200, 1400, 1400), 0.2)
+    assert max(Image.open(io.BytesIO(big)).size) == face_discover.CROP_MAX_SIDE
+
+
+IDENTITY_COLOURS = {"alice": (220, 40, 40), "bob": (40, 200, 60), "carol": (50, 60, 230)}
+DISCOVER_EXTS = {".jpg", ".png"}
+
+
+class FakeDiscoverBackend:
+    """Stands in for the face workers. A face is a solid square in its person's colour on a grey photo, so it is
+    found again in any crop of that photo; its embedding is the person's own axis plus a little noise."""
+    provider, concurrency = "FakeProvider", 4
+
+    def __init__(self):
+        self.images = 0
+
+    def detect(self, source):
+        data = source if isinstance(source, bytes) else Path(source).read_bytes()
+        pixels = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"), dtype=int)  # a corrupt file raises
+        self.images += 1
+        found = []
+        for axis, colour in enumerate(IDENTITY_COLOURS.values()):
+            ys, xs = np.nonzero(np.abs(pixels - colour).max(axis=2) <= 40)
+            if len(xs) < 1000:  # less than this of a square does not look like a face
+                continue
+            x0, y0, x1, y1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+            w, h = x1 - x0, y1 - y0
+            noise = np.random.default_rng(zlib.crc32(f"{axis} {x0} {y0}".encode())).normal(0, 0.03, 16)
+            found.append({"embedding": (np.eye(16)[axis] + noise).tolist(), "score": 0.95,
+                          "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                          "kps": [[x0 + .3 * w, y0 + .4 * h], [x0 + .7 * w, y0 + .4 * h], [x0 + .5 * w, y0 + .6 * h],
+                                  [x0 + .35 * w, y0 + .8 * h], [x0 + .65 * w, y0 + .8 * h]]})
+        return found
+
+    def summary(self):
+        return [{"worker": "fake", "host": "fake", "provider": self.provider, "threads": 1, "images": self.images,
+                 "failed": None}]
+
+    def close(self):
+        pass
+
+
+def make_discover_library(root):
+    """Alice in 7 photos, Bob in 5 (two with both), Carol in 2, a face too small, no face and a corrupt file."""
+    def photo(name, *squares):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (400, 300), (128, 128, 128))
+        for who, x, y, side in squares:
+            image.paste(IDENTITY_COLOURS[who], (x, y, x + side, y + side))
+        image.save(path, quality=95)
+
+    for i, (x, y) in enumerate([(30, 40), (150, 60), (250, 100), (60, 150), (200, 170)], 1):
+        photo(f"trip/alice-{i}.jpg", ("alice", x, y, 100))
+    photo("bob-1.jpg", ("bob", 50, 50, 100))
+    photo("trip/bob-1.jpg", ("bob", 180, 90, 100))  # the same file name in another folder
+    photo("bob-3.png", ("bob", 240, 150, 100))
+    photo("together.jpg", ("bob", 40, 100, 100), ("alice", 162, 100, 100))  # 22 px apart: a wide crop shows both
+    photo("crowd.jpg", ("bob", 20, 60, 150), ("alice", 170, 60, 150))  # side by side: no crop shows one alone
+    photo("trip/carol-1.jpg", ("carol", 60, 60, 100))
+    photo("trip/carol-2.jpg", ("carol", 200, 120, 100))
+    photo("tiny.jpg", ("alice", 100, 100, 40))
+    photo("nobody.jpg")
+    (root / "corrupt.jpg").write_bytes(b"not an image")
+    (root / "notes.txt").write_text("not a photo")
+    (root / "old crops" / "person-001").mkdir(parents=True)
+    (root / "old crops" / media.PEOPLE_MARKER).write_text("{}")
+    (root / "old crops" / "person-001" / "alice-old.jpg").write_bytes(b"crop of an earlier run: never opened")
+    return root
+
+
+def test_discovery_writes_one_checked_folder_of_crops_per_person(tmp_path):
+    photos = make_discover_library(tmp_path / "photos")
+    before = {p: p.read_bytes() for p in photos.rglob("*") if p.is_file()}
+    output = tmp_path / "faces"
+
+    r = face_discover.discover_people(photos, output, DISCOVER_EXTS, backend=FakeDiscoverBackend())
+
+    assert (r["photos"], r["with_faces"], r["errors"], r["faces"], r["compared"]) == (15, 13, 1, 15, 14)
+    assert r["skipped"] == {"too small": 1} and [n for _, n in r["sweep"]] == [2] * 6
+    assert [(p["name"], p["photos"], p["crops"]) for p in r["people"]] == [("person-001", 7, 6), ("person-002", 5, 4)]
+    assert (r["small_groups"], r["folders"], r["crops"], r["retried"]) == (1, 2, 10, 2)
+    assert r["rejected"] == {"other faces in the crop": 2}  # the shots of the crowd: no crop shows one face alone
+    assert sorted(p.name for p in output.iterdir()) == [media.PEOPLE_MARKER, "person-001", "person-002"]
+    assert sorted(c.name for c in (output / "person-001").iterdir()) == [
+        "alice-1.jpg", "alice-2.jpg", "alice-3.jpg", "alice-4.jpg", "alice-5.jpg", "together.jpg"]
+    assert sorted(c.name for c in (output / "person-002").iterdir()) == [
+        "bob-1-2.jpg", "bob-1.jpg", "bob-3.jpg", "together.jpg"]  # two photos named bob-1 do not overwrite
+    detector = FakeDiscoverBackend()
+    for folder, axis in (("person-001", 0), ("person-002", 1)):
+        for crop in (output / folder).iterdir():
+            [face] = detector.detect(crop.read_bytes())  # exactly one face in each crop, and it is that person
+            image = Image.open(crop)
+            assert np.argmax(face["embedding"]) == axis and image.format == "JPEG"
+            assert max(image.size) <= face_discover.CROP_MAX_SIDE and not image.getexif()
+    marker = json.loads((output / media.PEOPLE_MARKER).read_text())
+    assert (marker["format"], marker["people"], marker["similarity"], marker["min_photos"]) == (
+        "photosort-people-v1", 2, 0.35, 3)
+    assert {p: p.read_bytes() for p in photos.rglob("*") if p.is_file()} == before  # the photos are only read
+    text = face_discover.format_discover_report(r)
+    assert "2 with at least 3 photos" in text and "person-001" in text and "Next: rename the folders" in text
+    assert not any(name in text for name in ("alice-1", "together", "crowd", "corrupt"))  # counts only
+    assert "got no folder" not in text
+    gone = dict(r, people=r["people"] + [{"name": "person-003", "photos": 3, "faces": 3, "crops": 0}])
+    assert "1 person got no folder" in face_discover.format_discover_report(gone)  # a person whose crops all failed
+
+
+def test_discovery_dry_run_writes_nothing_and_its_limits_apply(tmp_path):
+    photos = make_discover_library(tmp_path / "photos")
+    output = tmp_path / "faces"
+
+    dry = face_discover.discover_people(photos, output, DISCOVER_EXTS, dry_run=True, backend=FakeDiscoverBackend())
+    assert not output.exists() and (len(dry["people"]), dry["folders"], dry["crops"]) == (2, 0, 0)
+    assert "nothing was written" in face_discover.format_discover_report(dry)
+    more = face_discover.discover_people(photos, output, DISCOVER_EXTS, min_photos=2, dry_run=True,
+                                         backend=FakeDiscoverBackend())
+    assert [p["photos"] for p in more["people"]] == [7, 5, 2]
+    four = face_discover.discover_people(photos, output, DISCOVER_EXTS, max_per_person=4,
+                                         backend=FakeDiscoverBackend())
+    assert [p["crops"] for p in four["people"]] == [4, 4] and four["crops"] == 8
+    assert four["rejected"] == {"other faces in the crop": 2}  # the best shot of each was the crowd: replaced
+
+
+def test_discovery_writes_only_to_a_new_or_empty_folder_apart_from_the_photos(tmp_path):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    (photos / "a.jpg").write_bytes(b"x")
+    (tmp_path / "full" / "person-001").mkdir(parents=True)
+    (tmp_path / "a-file").write_text("x")
+    for output in (photos / "faces", photos, tmp_path, tmp_path / "full", tmp_path / "a-file"):
+        with pytest.raises(ValueError, match="separate folders|new or empty"):
+            face_discover.discover_people(photos, output, DISCOVER_EXTS, backend=FakeDiscoverBackend())
+    assert not (photos / "faces").exists() and [p.name for p in (tmp_path / "full").iterdir()] == ["person-001"]
+
+
+def test_a_failed_write_leaves_no_half_written_people_folder(tmp_path, monkeypatch):
+    photos = make_discover_library(tmp_path / "photos")
+    real_write_text = Path.write_text
+
+    def fail_on_marker(self, *args, **kwargs):
+        if self.name == media.PEOPLE_MARKER:
+            raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_on_marker)
+    for output in (tmp_path / "new", tmp_path / "empty"):
+        output.parent.mkdir(exist_ok=True)
+        if output.name == "empty":
+            output.mkdir()
+        with pytest.raises(OSError, match="disk full"):
+            face_discover.discover_people(photos, output, DISCOVER_EXTS, backend=FakeDiscoverBackend())
+    assert not (tmp_path / "new").exists()  # a folder this run made is removed again
+    assert (tmp_path / "empty").is_dir() and not any((tmp_path / "empty").iterdir())  # the user's own stays, empty
+
+
+def test_folders_of_face_crops_are_not_photos_to_sort_group_index_or_tag(tmp_path):
+    crops = tmp_path / "crops"  # not a bucket name, so only the marker keeps it out
+    (crops / "person-001").mkdir(parents=True)
+    (crops / media.PEOPLE_MARKER).write_text("{}")
+    (crops / "person-001" / "crop.jpg").write_bytes(b"crop")
+    (tmp_path / "holiday").mkdir()
+    (tmp_path / "holiday" / "beach.jpg").write_bytes(b"pixels")
+
+    found, other = photosort.scan(tmp_path, tmp_path, BUCKETS, recursive=True)  # also what group looks at
+    assert [p.name for p in found] == ["beach.jpg"] and other == 0
+    assert photosort.scan(crops, crops, BUCKETS, recursive=False) == ([], 0)
+    s = photo_search.index_folder(CFG, tmp_path, FakeSearchClient(), photosort.IMAGE_EXTS)
+    assert (s["images"], s["errors"]) == (1, 0)
+    tagged = face_tagger._image_paths(tmp_path, {".jpg"}, True, tmp_path / "out.json", tmp_path / "reference", 0)
+    assert [p.name for p in tagged] == ["beach.jpg"]
+
+
+def test_faces_discover_command_prints_counts_only_and_refuses_bad_options(tmp_path, monkeypatch, capsys):
+    photos = make_discover_library(tmp_path / "photos")
+    monkeypatch.setattr(face_discover, "WorkerPool",
+                        SimpleNamespace(start=lambda specs, model, model_dir: FakeDiscoverBackend()))
+    config = cli_config(tmp_path)
+    base = ["--config", str(config), "faces-discover", str(photos)]
+
+    code = photosort.main(["--config", str(config), "--events", str(tmp_path / "ev.jsonl"), "faces-discover",
+                           str(photos), "--people", str(tmp_path / "faces"), "--similarity", "0.4"])
+
+    out = capsys.readouterr().out
+    assert code == 1  # a photo could not be read
+    assert "=== PhotoSort face-discovery report ===" in out and "person-002" in out
+    assert not any(name in out for name in ("alice-1", "together", "crowd", "corrupt"))
+    ev = events_in(tmp_path / "ev.jsonl")
+    assert (ev[0]["cmd"], ev[0]["params"]["similarity"]) == ("faces-discover", 0.4)
+    assert (ev[-1]["type"], ev[-1]["exit_code"], ev[-1]["summary"]["folders"]) == ("finish", 1, 2)
+    assert sorted(p.name for p in (tmp_path / "faces").iterdir()) == [media.PEOPLE_MARKER, "person-001", "person-002"]
+    assert photosort.main([*base, "--people", str(tmp_path / "other"), "--similarity", "1.5"]) == 2
+    assert photosort.main([*base, "--people", str(photos / "faces")]) == 2  # inside the photos
+    assert not (tmp_path / "other").exists() and not (photos / "faces").exists()
 
 
 FAKE_CAPTIONS = {
