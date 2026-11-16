@@ -296,10 +296,12 @@ in `components\Gallery.tsx`, shared controls in `components\ui.tsx`), `dashboard
     `dashboard.ps1` writes (README "Graphics");
   - this PC: NVIDIA RTX 4060 on AC, Intel Iris Xe on battery. That is drawing only, not inference.
 
-## Project website (`site\`, https://canvo.com/PhotoSort/)
+## Project website (`site\`, https://PhotoSort.canvo.com/)
 
 - Static page published by `.github\workflows\pages.yml` on push to `main` (README "Website"). Keep it in step
   with README when features, requirements or measured numbers change.
+- It lives on its own subdomain (Pages custom domain `PhotoSort.canvo.com`, DNS CNAME `photosort`). Never move it back under
+  `canvo.com/PhotoSort/`: that is the same browser origin as the owner's journal at `canvo.com`.
 - It is public: never put the user's photos, screenshots of the real dashboard, file names, LAN addresses or
   machine names on it. Illustrations must be drawn (CSS/SVG) or come from fixture mode or public images.
 - Keep it script-free with no outside requests except links (the page's CSP allows only its own CSS and images).
