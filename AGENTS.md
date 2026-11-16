@@ -296,6 +296,15 @@ in `components\Gallery.tsx`, shared controls in `components\ui.tsx`), `dashboard
     `dashboard.ps1` writes (README "Graphics");
   - this PC: NVIDIA RTX 4060 on AC, Intel Iris Xe on battery. That is drawing only, not inference.
 
+## Project website (`site\`, https://canvo.com/PhotoSort/)
+
+- Static page published by `.github\workflows\pages.yml` on push to `main` (README "Website"). Keep it in step
+  with README when features, requirements or measured numbers change.
+- It is public: never put the user's photos, screenshots of the real dashboard, file names, LAN addresses or
+  machine names on it. Illustrations must be drawn (CSS/SVG) or come from fixture mode or public images.
+- Keep it script-free with no outside requests except links (the page's CSP allows only its own CSS and images).
+  Preview on `127.0.0.1` (README "Website"); after pushing, check the Pages run and a `HEAD` of the live URL.
+
 ## Known facts (as of 2026-11-10)
 
 - Only spark1 accepts SSH. AxiDvBb1, CVPRISM2, MinDvBb1, ErsDvBb1 have port 22 closed; the Mac-mini has

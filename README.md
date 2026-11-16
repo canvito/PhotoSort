@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://canvo.com/PhotoSort/"><strong>Website</strong></a> &middot;
   <a href="#setup-once">Setup</a> &middot;
   <a href="#usage">Usage</a> &middot;
   <a href="#dashboard-dashboardps1">Dashboard quick start</a> &middot;
@@ -1114,3 +1115,41 @@ problem" with Try again / Reload window while the navigation keeps working. For 
 (filter by person, boxes over the preview), the Settings page (cloud models refused, review, save with a backup,
 Python refusals shown, Discard) and that every page names every control and has one heading and one main region.
 The test never attaches to the user's window and removes its temporary files when it finishes.
+
+## Website (canvo.com/PhotoSort)
+
+**Project page: <https://canvo.com/PhotoSort/>**. It is a one-page overview for visitors: what PhotoSort does, how
+it keeps photos local, measured speeds and a quick start, with links back to this guide. The account's GitHub Pages
+custom domain is `canvo.com`, so `canvito.github.io/PhotoSort` redirects there.
+
+The page is plain static files in `site\` (`index.html`, `css\site.css`, `icon.svg`): no scripts, cookies,
+analytics or third-party requests (its Content-Security-Policy allows only its own CSS and images). It holds **no
+personal data**: no photos or screenshots of your library, file names, LAN addresses or machine names. Its numbers
+come from this README. `.github\workflows\pages.yml` publishes `site\` to **GitHub Pages** on every push to `main`
+that changes `site\` or the workflow (repository **Settings → Pages → Source: GitHub Actions**), so the live page
+updates within a minute or two; progress is under the repository's **Actions** tab. To redeploy without a change,
+run the *Deploy to GitHub Pages* workflow manually (*Run workflow*).
+
+To edit it, change the files in `site\`, preview locally and push:
+
+```powershell
+& "$env:USERPROFILE\miniconda3\envs\utils\python.exe" -m http.server 47690 --bind 127.0.0.1 --directory site
+# open http://127.0.0.1:47690/ ; Ctrl+C to stop
+```
+
+### Hosting & architecture
+
+| Piece | Where | Notes |
+| --- | --- | --- |
+| Page | This repo, `site\` on `main` | Static HTML/CSS/SVG only. The PhotoSort app itself never runs on the web. |
+| Build & deploy | GitHub Actions (`.github\workflows\pages.yml`) | Copies `site\` to GitHub Pages. |
+| Hosting & CDN | GitHub Pages (GitHub's CDN) | No backend and no other cloud service. |
+| Domain | `canvo.com`, the custom domain of the user-site repo `canvito/canvito.github.io` | Project sites appear under it, so this one is `canvo.com/PhotoSort/`. HTTPS is enforced. |
+
+Changing the custom domain of `canvito/canvito.github.io` or the `canvo.com` DNS records also changes this page's
+URL (the same setup as [TestStripAnalyzer](https://canvo.com/TestStripAnalyzer/)). To check it:
+
+```powershell
+(Invoke-WebRequest https://canvo.com/PhotoSort/ -Method Head).Headers.Server   # GitHub.com
+gh api repos/canvito/PhotoSort/pages --jq '.html_url, .build_type, .https_enforced'
+```

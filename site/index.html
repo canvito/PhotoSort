@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'" />
+    <meta name="referrer" content="no-referrer" />
+    <title>PhotoSort: privacy-first AI for your photo and video library</title>
+    <meta name="description" content="Sort, gather, search and face-tag your photos and videos with AI models that run on your own machines. Nothing is sent to a cloud AI." />
+    <meta name="theme-color" content="#0f5e6e" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="css/site.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="./"><img src="icon.svg" alt="" width="28" height="28" />PhotoSort</a>
+      <nav aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#privacy">Privacy</a>
+        <a href="#start">Get started</a>
+        <a href="https://github.com/canvito/PhotoSort">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <img class="hero-icon" src="icon.svg" alt="" width="88" height="88" />
+        <h1>PhotoSort</h1>
+        <p class="tagline">Privacy-first AI for your photo and video library.</p>
+        <p class="lede">
+          Sort photos, screenshots and videos into folders, gather the ones from <em>"the birthday party last
+          Sunday"</em>, find anything with a plain-language search, and recognize the people in them, all with AI
+          models running on <strong>your own machines</strong>. Nothing is sent to a cloud AI.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/canvito/PhotoSort">View on GitHub</a>
+          <a class="button" href="#start">Get started</a>
+          <a class="button" href="https://github.com/canvito/PhotoSort#readme">Operator guide</a>
+        </div>
+        <ul class="pills" aria-label="At a glance">
+          <li>Local models only</li>
+          <li>Photos and videos</li>
+          <li>Preview, apply, undo</li>
+          <li>CLI and desktop dashboard</li>
+          <li>Windows</li>
+          <li>MIT license</li>
+        </ul>
+      </section>
+
+      <section id="features" class="band">
+        <h2>What it does</h2>
+        <div class="grid">
+          <article class="card">
+            <h3><span aria-hidden="true">🗂️</span> Sort into categories</h3>
+            <p>Classify photos, screenshots and videos into bucket folders you configure (people, food, nature,
+              receipts, chat screenshots, memes…), across a whole tree of subfolders into one flat set of buckets.</p>
+          </article>
+          <article class="card">
+            <h3><span aria-hidden="true">🎉</span> Gather by request</h3>
+            <p>Ask in plain language, for example "birthday party on last Sunday". Matching photos and videos go into
+              one folder; everything else stays where it is. Dates come from the files' capture time, not a guess.</p>
+          </article>
+          <article class="card">
+            <h3><span aria-hidden="true">🔎</span> Search and browse</h3>
+            <p>Each file gets a local caption and embedding, so "receipt from the hardware store" or "kids on the boat"
+              finds it. Browse results as thumbnails, and carry the index to another PC with export and import.</p>
+          </article>
+          <article class="card">
+            <h3><span aria-hidden="true">🧑‍🤝‍🧑</span> Tag and discover faces</h3>
+            <p>Match people in photos and videos against a few reference pictures per person, with no training.
+              Don't have references? <code>faces-discover</code> groups the faces in a folder into one folder per person
+              for you to name.</p>
+          </article>
+          <article class="card">
+            <h3><span aria-hidden="true">🖥️</span> Desktop dashboard</h3>
+            <p>Run jobs with live progress, browse a media gallery, review every past run, watch the model cluster
+              and privacy checks, and edit settings in a checked editor.</p>
+          </article>
+          <article class="card">
+            <h3><span aria-hidden="true">↩️</span> Safe and reversible</h3>
+            <p>Preview first, then apply exactly what the preview found. Every move is journaled and can be undone,
+              even after Ctrl+C. Files are moved byte-for-byte: never re-encoded, resized or stripped.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="how" class="band alt">
+        <h2>How it works</h2>
+        <ol class="flow" aria-label="Where your photos go">
+          <li>
+            <strong>Your PC</strong>
+            <span>Photos stay in your folders (OneDrive or local). PhotoSort reads them and sends work only to
+              <code>127.0.0.1</code>.</span>
+          </li>
+          <li>
+            <strong>NVIDIA PAIR proxy</strong>
+            <span>The Personal AI Router's Ollama endpoint on <code>127.0.0.1:11434</code> spreads requests across
+              your GPU machines.</span>
+          </li>
+          <li>
+            <strong>Your LAN GPUs</strong>
+            <span>Vision model <code>gemma4:12b</code> sorts and captions; <code>qwen3-embedding:8b</code> powers
+              search. Face detection (InsightFace) runs on LAN workers over SSH.</span>
+          </li>
+        </ol>
+        <p class="note">Videos are read as 8 evenly spread keyframes per request (faces use every keyframe). Audio is
+          never used.</p>
+      </section>
+
+      <section id="privacy" class="band">
+        <h2>Privacy by design</h2>
+        <div class="split">
+          <ul class="checks">
+            <li><strong>No cloud AI, enforced in code.</strong> Model requests may only go to a loopback address;
+              system proxies are ignored; cloud models (<code>…-cloud</code> names, or ones PAIR reports as remote) are
+              refused before any photo is sent.</li>
+            <li><strong>Face workers stay on your LAN.</strong> A worker on a public address is refused. Images travel
+              through an SSH tunnel and are decoded in memory.</li>
+            <li><strong>The search index is yours.</strong> Captions and embeddings live in a local file outside
+              OneDrive and outside the repo.</li>
+            <li><strong>Reports show counts, not names.</strong> Per-file lines go to a log you keep; finish reports
+              carry only totals, durations and per-bucket counts.</li>
+            <li><strong>Locked-down dashboard.</strong> Loopback-only server with a token and strict CSP; its window
+              blocks every request outside the dashboard and can hide itself from screen capture.</li>
+          </ul>
+          <aside class="card callout">
+            <h3>OneDrive is storage, not AI</h3>
+            <p>If your photos already live in OneDrive, it keeps syncing them as usual, including the new bucket and
+              group folders. No photo, frame, face, caption or embedding goes to a cloud AI model.</p>
+            <p><a href="https://github.com/canvito/PhotoSort#privacy-audit">Read the privacy audit</a></p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="band alt">
+        <h2>Measured on a home cluster</h2>
+        <div class="stats">
+          <div><b>~100</b><span>images/min sorted, sustained (gemma4:12b, 0 malformed replies in 205 calls)</span></div>
+          <div><b>~75</b><span>images/min captioned for search (12 requests in flight)</span></div>
+          <div><b>~3,660</b><span>images/min face-tagged on one DGX Spark worker</span></div>
+          <div><b>22/22</b><span>birthday-party photos found by <code>group</code> in a public test set</span></div>
+        </div>
+        <p class="note">Your numbers depend on your GPUs and network. Details and methods are in the
+          <a href="https://github.com/canvito/PhotoSort#model-choice-benchmark-2026-11-09">benchmark</a>.</p>
+      </section>
+
+      <section id="start" class="band">
+        <h2>Get started</h2>
+        <div>
+          <h3>You need</h3>
+          <ul>
+            <li>Windows with Python 3.12 (a Miniconda env named <code>utils</code>)</li>
+            <li>NVIDIA PAIR (Personal AI Router) on this PC, serving a vision
+              model (<code>gemma4:12b</code>) and an embedding model (<code>qwen3-embedding:8b</code>) from your
+              machines</li>
+            <li>For faces: a Linux or macOS machine on your LAN with SSH</li>
+          </ul>
+          <h3>Try it</h3>
+<pre><code>git clone https://github.com/canvito/PhotoSort.git
+cd PhotoSort
+conda create -n utils python=3.12
+conda run -n utils pip install -r requirements.txt
+
+.\photosort.cmd check
+.\photosort.cmd sort "&lt;folder&gt;" --action report   # preview
+.\photosort.cmd sort "&lt;folder&gt;"                   # move into buckets
+.\photosort.cmd undo "&lt;folder&gt;\_photosort_journal.jsonl"
+
+.\photosort.cmd group "&lt;folder&gt;" "birthday party on last Sunday"
+.\photosort.cmd index "&lt;folder&gt;"
+.\photosort.cmd search "kids on the boat"
+
+.\dashboard.ps1                                  # desktop dashboard</code></pre>
+        </div>
+        <p class="note">Full setup, every option and troubleshooting:
+          <a href="https://github.com/canvito/PhotoSort#readme">the operator guide</a>.</p>
+      </section>
+    </main>
+
+    <footer>
+      <p>PhotoSort is open source under the <a href="https://github.com/canvito/PhotoSort/blob/main/LICENSE">MIT
+        license</a>. Made by <a href="https://canvo.com/">canvo.com</a>. This page has no scripts, cookies or
+        analytics.</p>
+    </footer>
+  </body>
+</html>
