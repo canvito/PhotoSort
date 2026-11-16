@@ -1,4 +1,33 @@
-# PhotoSort
+<h1 align="center">PhotoSort</h1>
+
+<p align="center">
+  <strong>Privacy-first AI for your photo and video library.</strong><br>
+  Organize, search, and recognize people using local models, from a desktop dashboard or the command line.
+</p>
+
+<p align="center">
+  <a href="#setup-once">Setup</a> &middot;
+  <a href="#usage">Usage</a> &middot;
+  <a href="#dashboard-dashboardps1">Dashboard quick start</a> &middot;
+  <a href="#privacy-audit">Privacy audit</a>
+</p>
+
+## Executive summary
+
+| Feature | What it delivers |
+|---------|------------------|
+| **Sort into categories** | Automatically classify photos, screenshots and videos into configurable bucket folders, including recursively across subfolders. |
+| **Gather by request** | Use plain-language requests, such as "birthday party last Sunday", to gather matching media while leaving other files in place. |
+| **Search and browse** | Find media through natural-language search, browse thumbnail previews, and reuse the local search index on another PC through export/import. |
+| **Tag and discover faces** | Match people in photos and videos to named references, or group similar faces from photos into crop folders to review and name. |
+| **Desktop dashboard** | Run jobs with live progress, browse a media gallery, review run history, monitor cluster status and privacy checks, and manage settings. |
+| **Safe, reversible operations** | Preview before moving, apply an approved preview, undo changes, and safely cancel runs with a journal. Original media bytes are preserved. |
+| **Privacy by design** | Run local models through NVIDIA PAIR and face detection on separate trusted LAN workers over SSH. Media and derived data are not sent to cloud AI. |
+
+Face discovery is photos-only and currently command-line only. OneDrive remains storage, not AI processing:
+files and outputs in OneDrive-backed folders still sync normally.
+
+---
 
 Sorts photos, screenshots and videos into bucket folders (people, food, screenshot_chat, …), gathers the ones
 that match a plain-language request ("birthday party last Sunday") into one folder, finds them by
