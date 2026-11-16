@@ -1,0 +1,22 @@
+{
+  "base_url": "http://127.0.0.1:47617",
+  "model": "gemma4:12b",
+  "caption_model": "gemma4:12b",
+  "embed_model": "qwen3-embedding:8b",
+  "concurrency": 4,
+  "index_concurrency": 4,
+  "max_side": 512,
+  "timeout_s": 30,
+  "retries": 1,
+  "action": "move",
+  "face_workers": [],
+  "index_path": "%LOCALAPPDATA%\\PhotoSort\\dashboard-fixture\\search_index.sqlite",
+  "buckets": {
+    "people": "Photos whose main subject is one or more people.",
+    "food": "Photos of food or drinks.",
+    "nature": "Outdoor nature: landscapes, plants, sky.",
+    "documents_receipts": "Camera photos of paper documents or receipts.",
+    "screenshot_other": "Screenshots of a phone or computer screen.",
+    "other": "Anything that fits none of the other buckets."
+  }
+}

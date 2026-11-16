@@ -1,0 +1,3 @@
+# Local test photos and raw run logs are never committed
+images/
+results.jsonl

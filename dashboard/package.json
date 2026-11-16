@@ -1,0 +1,33 @@
+{
+  "name": "photosort-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-only dashboard for PhotoSort. Start and stop it with ..\\dashboard.ps1.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.11 <27"
+  },
+  "scripts": {
+    "build": "vite build --config web/vite.config.ts",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.10",
+    "fastify": "5.12.8",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "wouter": "3.13.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "electron": "45.2.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.7",
+    "vitest": "5.1.0"
+  }
+}
