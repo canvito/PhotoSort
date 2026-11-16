@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[codz]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Logs (per-file lines hold file names from your folders)
+*.log
+
+# Node.js and dashboard build output
+node_modules/
+dist/
+out/
+test-results/
+playwright-report/
+
+# Downloaded public test images for the dashboard
+dashboard/fixtures/public/
+# The copy the dashboard's Settings page keeps before saving config.json
+config.json.bak
+
+# Never commit personal media or PhotoSort output from your folders
+_photosort_journal*.jsonl
+_photosort_group.json
+_photosort_people.json
+photosort_faces.json
+*.sqlite

@@ -38,10 +38,13 @@ as any feature, config or procedure change.
 
 ## Environment
 
-- Run from `C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort`.
-- Python: `C:\Users\<you>\miniconda3\envs\utils\python.exe` (plain `python` is the Windows Store shim).
+- Run from the repo root, `$env:USERPROFILE\Documents\GitHub\canvito\PhotoSort` on the user's PCs.
+- Python: `$env:USERPROFILE\miniconda3\envs\utils\python.exe` (plain `python` is the Windows Store shim).
   `.\photosort.cmd` wraps it.
-- Tests: `C:\Users\<you>\miniconda3\envs\utils\python.exe -m pytest -q tests`
+- Tests: `& "$env:USERPROFILE\miniconda3\envs\utils\python.exe" -m pytest -q tests`
+- This repo is **public**. Never commit personal data: no photos, file names from the user's folders, captions,
+  journals, face results, logs, LAN IP addresses or the Windows user name (write `C:\Users\<you>` or
+  `$env:USERPROFILE` in docs). Synthetic fixtures and public test images only.
 
 ## Sort photos and videos into buckets
 

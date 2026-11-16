@@ -27,10 +27,25 @@ for you, with live progress, searches and browses the index with thumbnails, and
 `faces-discover` is command-line only for now. Start the dashboard with `.\dashboard.ps1` and stop it with
 `.\dashboard.ps1 stop`.
 
+**Requirements:** Windows, [NVIDIA PAIR](#model-choice-benchmark-2026-11-09) on this PC with a vision model
+(`gemma4:12b`) and an embedding model (`qwen3-embedding:8b`) served on the LAN, and Python 3.12 in a Miniconda
+env named `utils`. Face tagging also needs a Linux or macOS face worker reachable over SSH (see
+[Local face tagging](#local-face-tagging)).
+
+**History:** PhotoSort started in the `PhotoSort/` folder of a private tools repo and moved here on 2026-11-15
+with its full commit history (authors, dates and messages kept). Before the move, home LAN addresses and the
+Windows user name were rewritten out of that history. No pull request was involved. License: [MIT](LICENSE).
+
 ## Setup (once)
 
 ```powershell
-# Dependencies live in the `utils` conda env (already installed). To reinstall:
+# Get the code
+cd $env:USERPROFILE\Documents\GitHub\canvito
+git clone https://github.com/canvito/PhotoSort.git
+cd PhotoSort
+
+# Dependencies live in the `utils` conda env. To create it (once) or reinstall:
+conda create -n utils python=3.12      # skip if the env exists
 C:\Users\<you>\miniconda3\envs\utils\python.exe -m pip install -r requirements.txt
 ```
 
@@ -46,7 +61,7 @@ PAIR must be running on this PC (it provides the proxy on port 11434).
 ## Usage
 
 ```powershell
-cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
+cd C:\Users\<you>\Documents\GitHub\canvito\PhotoSort
 
 # 1. Is the PAIR proxy up and the model available?
 .\photosort.cmd check
@@ -78,7 +93,7 @@ cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
 .\photosort.cmd undo "<folder>\_photosort_journal.jsonl" --run-id 20261109-111724-591f86
 ```
 
-From another folder, use the full path: `C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort\photosort.cmd`.
+From another folder, use the full path: `C:\Users\<you>\Documents\GitHub\canvito\PhotoSort\photosort.cmd`.
 With the env activated (`conda activate utils`), `python photosort.py ...` works the same way.
 
 Behavior:
@@ -590,7 +605,7 @@ and its routing audit, live privacy checks) and [**faces and settings**](#faces-
 its results; a checked editor for `config.json`).
 
 ```powershell
-cd C:\Users\<you>\Documents\GitHub\canvito\utils\PhotoSort
+cd C:\Users\<you>\Documents\GitHub\canvito\PhotoSort
 .\dashboard.ps1            # start: installs what is missing (asks first), starts the server, opens the window
 .\dashboard.ps1 stop       # closes the window and stops the server
 .\dashboard.ps1 status     # running or not, versions, PAIR and model state (no file names or paths)
