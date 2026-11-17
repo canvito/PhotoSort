@@ -49,6 +49,58 @@
         </ul>
       </section>
 
+      <section class="notice-band" aria-labelledby="disclaimer-title">
+        <div class="card disclaimer" id="disclaimer">
+          <h2 id="disclaimer-title"><span aria-hidden="true">⚠️</span> For educational use only</h2>
+          <p class="disclaimer-summary">
+            Sorting, grouping, search and face results are <b>estimates</b> made by AI models and computer vision, and
+            <b>may be inaccurate</b>. Accuracy depends on how each photo or video was captured (lighting, focus, motion
+            blur, resolution, angle, faces turned away or covered), on the models you run and on your settings. Don't
+            rely on it alone: <b>preview before moving files, keep a backup of your library, and check results that
+            matter yourself.</b>
+          </p>
+          <details>
+            <summary>Full disclaimer</summary>
+            <ol>
+              <li><b>Educational and informational use only.</b> PhotoSort is a personal hobby project, not professional
+                software or advice of any kind.</li>
+              <li><b>AI results are estimates.</b> Buckets, group matches, dates read from requests, captions, search
+                results, face matches and the people found by <code>faces-discover</code> come from AI models and may be
+                wrong or incomplete. A video is judged from a few sampled frames, so content between those frames can be
+                missed. Results can change with the model, its version and the machine that serves it.</li>
+              <li><b>Face recognition can be wrong.</b> It can miss a person, match the wrong person or split one person
+                in two. Never use it to identify people for security, legal, employment, law-enforcement or other
+                decisions that affect them. Face data can be biometric data under the law where you live: you are
+                responsible for having the right to process the faces of the people in your photos, and for respecting
+                their privacy.</li>
+              <li><b>It moves your files.</b> <code>sort</code>, <code>group</code> and <code>apply</code> move files by
+                default, and <code>undo</code> moves them back from a journal. Errors, interruptions, cloud-sync
+                conflicts, full disks or changes made by other programs can leave files misplaced or, in rare cases,
+                lost. Use <code>--action report</code> to preview, keep backups, and check the result.</li>
+              <li><b>Your setup, your responsibility.</b> PhotoSort sends model requests only to a local endpoint and
+                refuses cloud models, but it cannot control the machines, models, network, router software or cloud
+                storage you use. Keeping those secure, and choosing what is stored where, is up to you.</li>
+              <li><b>Third-party software and models.</b> Models (for example <code>gemma4:12b</code>,
+                <code>qwen3-embedding:8b</code> and InsightFace <code>buffalo_l</code>) and tools (NVIDIA PAIR, Ollama,
+                InsightFace, PyAV/FFmpeg) come with their own licenses and terms. InsightFace's pretrained model weights
+                are for non-commercial research use only. Review the terms before you use them, especially for anything
+                commercial.</li>
+              <li><b>Speeds are examples.</b> Measured speeds and accuracy figures come from one home setup and public
+                test images; yours will differ.</li>
+              <li><b>No warranty.</b> PhotoSort is provided “as is”, without warranty of any kind, as stated in its
+                <a href="https://github.com/canvito/PhotoSort/blob/main/LICENSE">MIT license</a>.</li>
+              <li><b>Limitation of liability.</b> To the fullest extent permitted by law, the authors and contributors are
+                not liable for any loss or damage, including lost, misplaced or mislabeled files, privacy harms,
+                misidentification of people, or damage to equipment or property, arising from the use of, or reliance
+                on, PhotoSort. You use it at your own risk.</li>
+              <li><b>No affiliation.</b> Not affiliated with, endorsed or sponsored by NVIDIA, Google, Alibaba (Qwen),
+                Ollama, InsightFace, Microsoft (OneDrive) or any other company named here. Trademarks belong to their
+                owners.</li>
+            </ol>
+          </details>
+        </div>
+      </section>
+
       <section id="features" class="band">
         <h2>What it does</h2>
         <div class="grid">
@@ -180,6 +232,8 @@ conda run -n utils pip install -r requirements.txt
     </main>
 
     <footer>
+      <p><b>For educational use only.</b> Results are AI estimates and may be inaccurate. Provided “as is”, without
+        warranty; use at your own risk. <a href="#disclaimer">Full disclaimer</a>.</p>
       <p>PhotoSort is open source under the <a href="https://github.com/canvito/PhotoSort/blob/main/LICENSE">MIT
         license</a>. Made by <a href="https://canvo.com/">canvo.com</a>. This page has no scripts, cookies or
         analytics.</p>

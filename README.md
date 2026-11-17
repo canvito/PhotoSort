@@ -13,6 +13,10 @@
   <a href="#privacy-audit">Privacy audit</a>
 </p>
 
+> ⚠️ **For educational use only.** Sorting, grouping, search and face results are AI estimates and may be inaccurate;
+> they depend on how each photo or video was captured. Preview before moving files and keep a backup. See the
+> [Disclaimer](DISCLAIMER.md).
+
 ## Executive summary
 
 | Feature | What it delivers |
@@ -1155,3 +1159,12 @@ setup as [TestStripAnalyzer](https://TestStripAnalyzer.canvo.com/)). To check it
 (Invoke-WebRequest https://PhotoSort.canvo.com/ -Method Head).Headers.Server   # GitHub.com
 gh api repos/canvito/PhotoSort/pages --jq '.cname, .build_type, .https_enforced'   # photosort.canvo.com, workflow, true
 ```
+
+## Disclaimer
+
+For educational use only. Sorting, grouping, search and face results are computer-vision and AI estimates whose
+accuracy depends on how each photo or video was captured, the models and the settings. They are not professional
+advice, come with no warranty, and should be checked before you rely on them; preview before moving files and keep a
+backup. Face recognition must never be used to make decisions about people. Full text: [DISCLAIMER.md](DISCLAIMER.md).
+The project page shows the same notice near the top of the page (`site\index.html`, `#disclaimer`, with the full
+text under *Full disclaimer*) and a one-line reminder in its footer. Keep `DISCLAIMER.md` and the page in sync.

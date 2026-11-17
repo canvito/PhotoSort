@@ -306,6 +306,8 @@ in `components\Gallery.tsx`, shared controls in `components\ui.tsx`), `dashboard
   machine names on it. Illustrations must be drawn (CSS/SVG) or come from fixture mode or public images.
 - Keep it script-free with no outside requests except links (the page's CSP allows only its own CSS and images).
   Preview on `127.0.0.1` (README "Website"); after pushing, check the Pages run and a `HEAD` of the live URL.
+- The `#disclaimer` notice (below the hero) and the footer reminder must stay on the page, with the same text as
+  `DISCLAIMER.md`; change both together. Do not remove or weaken them without the user asking.
 
 ## Known facts (as of 2026-11-10)
 
